@@ -21,6 +21,8 @@ define( 'OWSC_DIR', plugin_dir_path( __FILE__ ) );
 // Load dependencies
 require_once OWSC_DIR . 'includes/class-owsc-odoo-xmlrpc-client.php';
 require_once OWSC_DIR . 'includes/class-owsc-connection-test.php';
+require_once OWSC_DIR . 'includes/class-owsc-sku-audit.php';
+require_once OWSC_DIR . 'includes/class-owsc-sku-audit-admin.php';
 
 final class OWSCPluginV2 {
     const OPTION_NAME = 'owsc_odoo_settings';
@@ -31,6 +33,9 @@ final class OWSCPluginV2 {
         
         // Register the connection test handler
         OWSC_Connection_Test::instance()->register();
+
+        // Register the SKU Audit UI
+        new OWSC_SKU_Audit_Admin();
     }
 
     public static function configuration(): array {
