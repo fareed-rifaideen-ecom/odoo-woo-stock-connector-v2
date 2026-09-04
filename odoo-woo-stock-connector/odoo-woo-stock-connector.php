@@ -1,8 +1,11 @@
 <?php
 /**
  * Plugin Name: Odoo WooCommerce Stock Connector V2
+ * Plugin URI: https://github.com/fareed-rifaideen-ecom/odoo-woo-stock-connector-v2
  * Description: V2 foundation for a secure Odoo 18 and WooCommerce inventory connector.
  * Version: 2.1.0
+ * Author: Fareed M. Rifaideen
+ * Author URI: https://fareed-rifaideen.netlify.app/
  * Requires PHP: 7.4
  * Requires Plugins: woocommerce
  */
