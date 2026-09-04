@@ -3,7 +3,7 @@
  * Plugin Name: Odoo WooCommerce Stock Connector V2
  * Plugin URI: https://github.com/fareed-rifaideen-ecom/odoo-woo-stock-connector-v2
  * Description: V2 foundation for a secure Odoo 18 and WooCommerce inventory connector.
- * Version: 2.1.0
+ * Version: 2.2.0
  * Author: Fareed M. Rifaideen
  * Author URI: https://fareed-rifaideen.netlify.app/
  * Requires PHP: 7.4
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OWSC_VERSION', '2.1.0' );
+define( 'OWSC_VERSION', '2.2.0' );
 define( 'OWSC_FILE', __FILE__ );
 define( 'OWSC_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -23,7 +23,7 @@ require_once OWSC_DIR . 'includes/class-owsc-odoo-xmlrpc-client.php';
 require_once OWSC_DIR . 'includes/class-owsc-connection-test.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit-admin.php';
-require_once OWSC_DIR . 'includes/class-owsc-stock-sync.php'; // NEW: Load Bulk Sync
+require_once OWSC_DIR . 'includes/class-owsc-stock-sync.php';
 
 final class OWSCPluginV2 {
     const OPTION_NAME = 'owsc_odoo_settings';
@@ -31,19 +31,28 @@ final class OWSCPluginV2 {
     public static function boot(): void {
         add_action( 'admin_menu', array( __CLASS__, 'register_menu' ) );
         add_action( 'admin_post_owsc_save_settings', array( __CLASS__, 'save_settings' ) );
-        add_action( 'admin_post_owsc_run_bulk_sync', array( __CLASS__, 'handle_bulk_sync' ) ); // NEW: Sync handler
+        add_action( 'admin_post_owsc_run_bulk_sync', array( __CLASS__, 'handle_bulk_sync' ) );
+        
+        // Register the background cron job hook
+        add_action( 'owsc_cron_stock_sync', array( __CLASS__, 'run_scheduled_sync' ) );
         
         OWSC_Connection_Test::instance()->register();
         new OWSC_SKU_Audit_Admin();
     }
 
+    public static function deactivate(): void {
+        wp_clear_scheduled_hook( 'owsc_cron_stock_sync' );
+    }
+
     public static function configuration(): array {
         $settings = get_option( self::OPTION_NAME, array() );
         return array(
-            'url'      => (string) ( $settings['url'] ?? '' ),
-            'database' => (string) ( $settings['database'] ?? '' ),
-            'username' => (string) ( $settings['username'] ?? '' ),
-            'api_key'  => (string) ( $settings['api_key'] ?? '' ),
+            'url'           => (string) ( $settings['url'] ?? '' ),
+            'database'      => (string) ( $settings['database'] ?? '' ),
+            'username'      => (string) ( $settings['username'] ?? '' ),
+            'api_key'       => (string) ( $settings['api_key'] ?? '' ),
+            'sync_enabled'  => (string) ( $settings['sync_enabled'] ?? 'no' ),
+            'sync_interval' => (string) ( $settings['sync_interval'] ?? 'hourly' ),
         );
     }
 
@@ -85,7 +94,7 @@ final class OWSCPluginV2 {
                 </div>
             <?php endif; ?>
 
-            <p><strong>Phase:</strong> Dashboard-managed configuration.</p>
+            <p><strong>Phase:</strong> Automated Synchronization Configuration.</p>
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
                 <input type="hidden" name="action" value="owsc_save_settings">
                 <?php wp_nonce_field( 'owsc_save_settings' ); ?>
@@ -109,13 +118,33 @@ final class OWSCPluginV2 {
                             <p class="description">Leave blank to retain the currently saved API key.</p>
                         </td>
                     </tr>
+                    <tr>
+                        <th scope="row"><label for="sync_enabled">Automated Sync</label></th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="sync_enabled" id="sync_enabled" value="yes" <?php checked( $config['sync_enabled'], 'yes' ); ?>>
+                                Enable automatic background stock synchronization
+                            </label>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="sync_interval">Sync Interval</label></th>
+                        <td>
+                            <select name="sync_interval" id="sync_interval">
+                                <option value="hourly" <?php selected( $config['sync_interval'], 'hourly' ); ?>>Hourly</option>
+                                <option value="twicedaily" <?php selected( $config['sync_interval'], 'twicedaily' ); ?>>Twice Daily (Every 12 hours)</option>
+                                <option value="daily" <?php selected( $config['sync_interval'], 'daily' ); ?>>Daily</option>
+                            </select>
+                            <p class="description">How often the plugin should fetch stock updates from Odoo.</p>
+                        </td>
+                    </tr>
                 </table>
                 <?php submit_button( 'Save Connection Settings' ); ?>
             </form>
 
             <hr />
             <h2>Bulk Stock Synchronization</h2>
-            <p>This will query Odoo for all products with <strong>Available for WooCommerce Sync</strong> checked, aggregate their stock across WH, MC, and JM, and update matched SKUs in WooCommerce.</p>
+            <p>This will immediately query Odoo for all products with <strong>Available for WooCommerce Sync</strong> checked, aggregate their stock across WH, MC, and JM, and update matched SKUs in WooCommerce.</p>
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
                 <input type="hidden" name="action" value="owsc_run_bulk_sync">
                 <?php wp_nonce_field( 'owsc_run_bulk_sync' ); ?>
@@ -138,15 +167,27 @@ final class OWSCPluginV2 {
 
         $old_config = self::configuration();
         $submitted_key = isset( $_POST['api_key'] ) ? trim( (string) wp_unslash( $_POST['api_key'] ) ) : '';
+        
+        $sync_enabled = isset( $_POST['sync_enabled'] ) ? 'yes' : 'no';
+        $allowed_intervals = array( 'hourly', 'twicedaily', 'daily' );
+        $sync_interval = in_array( $_POST['sync_interval'] ?? '', $allowed_intervals, true ) ? sanitize_text_field( wp_unslash( $_POST['sync_interval'] ) ) : 'hourly';
 
         $new_config = array(
-            'url'      => esc_url_raw( trim( (string) wp_unslash( $_POST['url'] ?? '' ) ) ),
-            'database' => sanitize_text_field( wp_unslash( $_POST['database'] ?? '' ) ),
-            'username' => sanitize_text_field( wp_unslash( $_POST['username'] ?? '' ) ),
-            'api_key'  => $submitted_key ? $submitted_key : $old_config['api_key'],
+            'url'           => esc_url_raw( trim( (string) wp_unslash( $_POST['url'] ?? '' ) ) ),
+            'database'      => sanitize_text_field( wp_unslash( $_POST['database'] ?? '' ) ),
+            'username'      => sanitize_text_field( wp_unslash( $_POST['username'] ?? '' ) ),
+            'api_key'       => $submitted_key ? $submitted_key : $old_config['api_key'],
+            'sync_enabled'  => $sync_enabled,
+            'sync_interval' => $sync_interval,
         );
 
         update_option( self::OPTION_NAME, $new_config, false );
+
+        // Handle Cron Scheduling
+        wp_clear_scheduled_hook( 'owsc_cron_stock_sync' );
+        if ( $sync_enabled === 'yes' ) {
+            wp_schedule_event( time(), $sync_interval, 'owsc_cron_stock_sync' );
+        }
 
         wp_safe_redirect( add_query_arg( array( 'page' => 'owsc-connector', 'settings-updated' => 'true' ), admin_url( 'admin.php' ) ) );
         exit;
@@ -165,6 +206,15 @@ final class OWSCPluginV2 {
         wp_safe_redirect( add_query_arg( array( 'page' => 'owsc-connector' ), admin_url( 'admin.php' ) ) );
         exit;
     }
+
+    public static function run_scheduled_sync(): void {
+        $config = self::configuration();
+        if ( $config['sync_enabled'] === 'yes' ) {
+            $sync_service = new OWSC_Stock_Sync();
+            $sync_service->run_sync();
+        }
+    }
 }
 
+register_deactivation_hook( OWSC_FILE, array( 'OWSCPluginV2', 'deactivate' ) );
 OWSCPluginV2::boot();
