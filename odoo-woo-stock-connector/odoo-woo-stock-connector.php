@@ -18,8 +18,9 @@ define( 'OWSC_VERSION', '2.1.0' );
 define( 'OWSC_FILE', __FILE__ );
 define( 'OWSC_DIR', plugin_dir_path( __FILE__ ) );
 
-// Load the XML-RPC client dependency
+// Load dependencies
 require_once OWSC_DIR . 'includes/class-owsc-odoo-xmlrpc-client.php';
+require_once OWSC_DIR . 'includes/class-owsc-connection-test.php';
 
 final class OWSCPluginV2 {
     const OPTION_NAME = 'owsc_odoo_settings';
@@ -27,6 +28,9 @@ final class OWSCPluginV2 {
     public static function boot(): void {
         add_action( 'admin_menu', array( __CLASS__, 'register_menu' ) );
         add_action( 'admin_post_owsc_save_settings', array( __CLASS__, 'save_settings' ) );
+        
+        // Register the connection test handler
+        OWSC_Connection_Test::instance()->register();
     }
 
     public static function configuration(): array {
@@ -61,6 +65,7 @@ final class OWSCPluginV2 {
         ?>
         <div class="wrap">
             <h1>Odoo WooCommerce Stock Connector V2</h1>
+            <?php OWSC_Connection_Test::instance()->render_notice(); ?>
             <p><strong>Phase:</strong> Dashboard-managed configuration. Enter your Odoo 18 staging credentials below.</p>
             
             <?php if ( $is_saved ) : ?>
@@ -102,6 +107,12 @@ final class OWSCPluginV2 {
                 </table>
                 <?php submit_button( 'Save Connection Settings' ); ?>
             </form>
+
+            <hr />
+            <h2>Connection Test</h2>
+            <p>This test only calls Odoo's version and authenticate methods. It does not read or change any business data.</p>
+            <?php OWSC_Connection_Test::instance()->render_test_form(); ?>
+
         </div>
         <?php
     }
