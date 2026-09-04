@@ -16,7 +16,7 @@ class OWSC_SKU_Audit {
             'fields'               => array(),
             'odoo_products'        => array(),
             'woocommerce_products' => array(),
-            'locations'            => array(), // New array to hold stock data
+            'locations'            => array(),
             'messages'             => array(),
         );
 
@@ -55,8 +55,7 @@ class OWSC_SKU_Audit {
             $result['messages'][] = 'WooCommerce SKU must resolve to exactly one product or variation before synchronization is considered.';
         }
 
-        // --- NEW: Read-only stock.quant discovery ---
-        // Only proceed to check stock if we have a perfect 1-to-1 match
+        // --- Read-only stock.quant discovery with Aggregation ---
         if ( 1 === count( $result['odoo_products'] ) && 1 === count( $result['woocommerce_products'] ) ) {
             $odoo_product_id = $result['odoo_products'][0]['id'];
 
@@ -69,13 +68,28 @@ class OWSC_SKU_Audit {
             );
 
             if ( ! is_wp_error( $quants ) && is_array( $quants ) ) {
+                
+                // Aggregate quantities by location_id to prevent duplicate rows
+                $aggregated_quants = array();
                 $location_ids = array();
+                
                 foreach ( $quants as $quant ) {
-                    if ( isset( $quant['location_id'][0] ) ) {
-                        $location_ids[] = $quant['location_id'][0];
+                    $loc_id = $quant['location_id'][0] ?? 0;
+                    if ( ! $loc_id ) {
+                        continue;
                     }
+                    
+                    if ( ! isset( $aggregated_quants[ $loc_id ] ) ) {
+                        $aggregated_quants[ $loc_id ] = array(
+                            'quantity' => 0,
+                            'reserved' => 0,
+                        );
+                        $location_ids[] = $loc_id;
+                    }
+                    
+                    $aggregated_quants[ $loc_id ]['quantity'] += (float) ( $quant['quantity'] ?? 0 );
+                    $aggregated_quants[ $loc_id ]['reserved'] += (float) ( $quant['reserved_quantity'] ?? 0 );
                 }
-                $location_ids = array_unique( $location_ids );
 
                 $locations_data = array();
                 
@@ -94,23 +108,24 @@ class OWSC_SKU_Audit {
                             $loc_map[ $loc['id'] ] = $loc;
                         }
 
-                        // 3. Combine quant data with location details
-                        foreach ( $quants as $quant ) {
-                            $loc_id = $quant['location_id'][0] ?? 0;
-                            if ( $loc_id && isset( $loc_map[ $loc_id ] ) ) {
-                                $qty       = (float) ( $quant['quantity'] ?? 0 );
-                                $reserved  = (float) ( $quant['reserved_quantity'] ?? 0 );
-                                
+                        // 3. Format the final aggregated location data
+                        foreach ( $aggregated_quants as $loc_id => $totals ) {
+                            if ( isset( $loc_map[ $loc_id ] ) ) {
                                 $locations_data[] = array(
                                     'location_id'   => $loc_id,
                                     'complete_name' => $loc_map[ $loc_id ]['complete_name'] ?? 'Unknown',
                                     'usage'         => $loc_map[ $loc_id ]['usage'] ?? 'Unknown',
-                                    'quantity'      => $qty,
-                                    'reserved'      => $reserved,
-                                    'available'     => $qty - $reserved,
+                                    'quantity'      => $totals['quantity'],
+                                    'reserved'      => $totals['reserved'],
+                                    'available'     => $totals['quantity'] - $totals['reserved'],
                                 );
                             }
                         }
+                        
+                        // Sort alphabetically by complete_name for easier reading
+                        usort($locations_data, function($a, $b) {
+                            return strcmp($a['complete_name'], $b['complete_name']);
+                        });
                     }
                 }
                 $result['locations'] = $locations_data;
