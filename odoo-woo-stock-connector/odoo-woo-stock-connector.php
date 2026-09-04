@@ -23,6 +23,7 @@ require_once OWSC_DIR . 'includes/class-owsc-odoo-xmlrpc-client.php';
 require_once OWSC_DIR . 'includes/class-owsc-connection-test.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit-admin.php';
+require_once OWSC_DIR . 'includes/class-owsc-stock-sync.php'; // NEW: Load Bulk Sync
 
 final class OWSCPluginV2 {
     const OPTION_NAME = 'owsc_odoo_settings';
@@ -30,11 +31,9 @@ final class OWSCPluginV2 {
     public static function boot(): void {
         add_action( 'admin_menu', array( __CLASS__, 'register_menu' ) );
         add_action( 'admin_post_owsc_save_settings', array( __CLASS__, 'save_settings' ) );
+        add_action( 'admin_post_owsc_run_bulk_sync', array( __CLASS__, 'handle_bulk_sync' ) ); // NEW: Sync handler
         
-        // Register the connection test handler
         OWSC_Connection_Test::instance()->register();
-
-        // Register the SKU Audit UI
         new OWSC_SKU_Audit_Admin();
     }
 
@@ -66,41 +65,42 @@ final class OWSCPluginV2 {
         
         $config = self::configuration();
         $is_saved = isset( $_GET['settings-updated'] ) && $_GET['settings-updated'] === 'true';
+        $sync_message = get_transient( 'owsc_sync_message_' . get_current_user_id() );
+        delete_transient( 'owsc_sync_message_' . get_current_user_id() );
 
         ?>
         <div class="wrap">
             <h1>Odoo WooCommerce Stock Connector V2</h1>
             <?php OWSC_Connection_Test::instance()->render_notice(); ?>
-            <p><strong>Phase:</strong> Dashboard-managed configuration. Enter your Odoo 18 staging credentials below.</p>
             
+            <?php if ( $sync_message ) : ?>
+                <div class="notice notice-info is-dismissible">
+                    <p><strong><?php echo esc_html( $sync_message ); ?></strong></p>
+                </div>
+            <?php endif; ?>
+
             <?php if ( $is_saved ) : ?>
                 <div class="notice notice-success is-dismissible">
                     <p>Settings saved successfully.</p>
                 </div>
             <?php endif; ?>
 
+            <p><strong>Phase:</strong> Dashboard-managed configuration.</p>
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
                 <input type="hidden" name="action" value="owsc_save_settings">
                 <?php wp_nonce_field( 'owsc_save_settings' ); ?>
-                
                 <table class="form-table">
                     <tr>
                         <th scope="row"><label for="odoo_url">Odoo URL</label></th>
-                        <td>
-                            <input name="url" id="odoo_url" class="regular-text" type="url" value="<?php echo esc_attr( $config['url'] ); ?>" required placeholder="https://your-odoo-domain.example">
-                        </td>
+                        <td><input name="url" id="odoo_url" class="regular-text" type="url" value="<?php echo esc_attr( $config['url'] ); ?>" required></td>
                     </tr>
                     <tr>
                         <th scope="row"><label for="odoo_database">Odoo Database</label></th>
-                        <td>
-                            <input name="database" id="odoo_database" class="regular-text" type="text" value="<?php echo esc_attr( $config['database'] ); ?>" required>
-                        </td>
+                        <td><input name="database" id="odoo_database" class="regular-text" type="text" value="<?php echo esc_attr( $config['database'] ); ?>" required></td>
                     </tr>
                     <tr>
                         <th scope="row"><label for="odoo_username">Odoo Username</label></th>
-                        <td>
-                            <input name="username" id="odoo_username" class="regular-text" type="text" value="<?php echo esc_attr( $config['username'] ); ?>" required>
-                        </td>
+                        <td><input name="username" id="odoo_username" class="regular-text" type="text" value="<?php echo esc_attr( $config['username'] ); ?>" required></td>
                     </tr>
                     <tr>
                         <th scope="row"><label for="odoo_api_key">Odoo API Key</label></th>
@@ -114,10 +114,18 @@ final class OWSCPluginV2 {
             </form>
 
             <hr />
-            <h2>Connection Test</h2>
-            <p>This test only calls Odoo's version and authenticate methods. It does not read or change any business data.</p>
-            <?php OWSC_Connection_Test::instance()->render_test_form(); ?>
+            <h2>Bulk Stock Synchronization</h2>
+            <p>This will query Odoo for all products with <strong>Available for WooCommerce Sync</strong> checked, aggregate their stock across WH, MC, and JM, and update matched SKUs in WooCommerce.</p>
+            <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+                <input type="hidden" name="action" value="owsc_run_bulk_sync">
+                <?php wp_nonce_field( 'owsc_run_bulk_sync' ); ?>
+                <?php submit_button( 'Run Full Manual Sync', 'primary', 'submit', false ); ?>
+            </form>
 
+            <hr />
+            <h2>Connection Test</h2>
+            <p>This test only calls Odoo's version and authenticate methods.</p>
+            <?php OWSC_Connection_Test::instance()->render_test_form(); ?>
         </div>
         <?php
     }
@@ -140,10 +148,21 @@ final class OWSCPluginV2 {
 
         update_option( self::OPTION_NAME, $new_config, false );
 
-        wp_safe_redirect( add_query_arg( array(
-            'page'             => 'owsc-connector',
-            'settings-updated' => 'true'
-        ), admin_url( 'admin.php' ) ) );
+        wp_safe_redirect( add_query_arg( array( 'page' => 'owsc-connector', 'settings-updated' => 'true' ), admin_url( 'admin.php' ) ) );
+        exit;
+    }
+
+    public static function handle_bulk_sync(): void {
+        if ( ! current_user_can( 'manage_woocommerce' ) ) {
+            wp_die( 'Unauthorized.' );
+        }
+        check_admin_referer( 'owsc_run_bulk_sync' );
+
+        $sync_service = new OWSC_Stock_Sync();
+        $result = $sync_service->run_sync();
+
+        set_transient( 'owsc_sync_message_' . get_current_user_id(), $result['message'], MINUTE_IN_SECONDS );
+        wp_safe_redirect( add_query_arg( array( 'page' => 'owsc-connector' ), admin_url( 'admin.php' ) ) );
         exit;
     }
 }
