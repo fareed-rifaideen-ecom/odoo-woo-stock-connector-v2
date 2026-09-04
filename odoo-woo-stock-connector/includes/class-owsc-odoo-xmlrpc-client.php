@@ -22,6 +22,18 @@ class OWSC_Odoo_XMLRPC_Client {
         return $this->request( '/xmlrpc/2/common', 'authenticate', array( $database, $username, $api_key, array() ) );
     }
 
+    public function execute_kw( string $database, int $uid, string $api_key, string $model, string $method, array $args = array(), array $kwargs = array() ) {
+        return $this->request( '/xmlrpc/2/object', 'execute_kw', array(
+            $database,
+            $uid,
+            $api_key,
+            $model,
+            $method,
+            $args,
+            $kwargs
+        ) );
+    }
+
     private function request( string $endpoint, string $method, array $params ) {
         if ( empty( $this->base_url ) || ! wp_http_validate_url( $this->base_url ) ) {
             return new WP_Error( 'owsc_invalid_url', 'Odoo URL is missing or invalid.' );
