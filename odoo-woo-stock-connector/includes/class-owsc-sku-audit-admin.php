@@ -7,6 +7,7 @@ class OWSC_SKU_Audit_Admin {
     public function __construct() {
         add_action( 'admin_menu', array( $this, 'register_menu' ) );
         add_action( 'admin_post_owsc_run_sku_audit', array( $this, 'handle_run' ) );
+        add_action( 'admin_post_owsc_run_sku_sync', array( $this, 'handle_sync' ) ); // New Sync Handler
     }
 
     public function register_menu(): void {
@@ -32,7 +33,7 @@ class OWSC_SKU_Audit_Admin {
         ?>
         <div class="wrap">
             <h1>Odoo SKU Audit</h1>
-            <p><strong>Phase:</strong> Read-only Odoo and WooCommerce SKU preflight. No records are changed.</p>
+            <p><strong>Phase:</strong> Manual One-SKU Write Test.</p>
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
                 <input type="hidden" name="action" value="owsc_run_sku_audit">
                 <?php wp_nonce_field( 'owsc_run_sku_audit' ); ?>
@@ -40,7 +41,7 @@ class OWSC_SKU_Audit_Admin {
                 <p><input id="owsc-sku" name="sku" type="text" class="regular-text" value="<?php echo esc_attr( $sku ); ?>" required></p>
                 <?php submit_button( 'Run Read-only Preflight', 'primary', 'submit', false ); ?>
             </form>
-            <?php $this->render_result( $result ); ?>
+            <?php $this->render_result( $result, $sku ); ?>
         </div>
         <?php
     }
@@ -64,9 +65,48 @@ class OWSC_SKU_Audit_Admin {
         exit;
     }
 
-    private function render_result( $result ): void {
+    public function handle_sync(): void {
+        if ( ! current_user_can( 'manage_woocommerce' ) ) {
+            wp_die( 'Unauthorized.' );
+        }
+        check_admin_referer( 'owsc_run_sku_sync' );
+        
+        $sku             = isset( $_POST['sku'] ) ? sanitize_text_field( wp_unslash( $_POST['sku'] ) ) : '';
+        $woo_id          = isset( $_POST['woo_id'] ) ? absint( $_POST['woo_id'] ) : 0;
+        $proposed_qty    = isset( $_POST['proposed_qty'] ) ? (float) $_POST['proposed_qty'] : 0;
+        $proposed_status = isset( $_POST['proposed_status'] ) ? sanitize_text_field( wp_unslash( $_POST['proposed_status'] ) ) : 'outofstock';
+
+        $audit_service = new OWSC_SKU_Audit();
+        
+        // 1. Execute the sync
+        $sync_result = $audit_service->sync_stock( $sku, $woo_id, $proposed_qty, $proposed_status );
+        
+        // 2. Re-run the preflight to show the updated, live data
+        $result = $audit_service->preflight( $sku );
+        
+        // 3. Attach the success/error message to the top of the results
+        array_unshift( $result['messages'], $sync_result['message'] );
+
+        set_transient( 'owsc_sku_audit_' . get_current_user_id(), $result, MINUTE_IN_SECONDS );
+        
+        wp_safe_redirect( add_query_arg( array(
+            'page' => 'owsc-sku-audit',
+            'sku'  => rawurlencode( $sku )
+        ), admin_url( 'admin.php' ) ) );
+        exit;
+    }
+
+    private function render_result( $result, $sku ): void {
         if ( ! is_array( $result ) ) {
             return;
+        }
+
+        // Output Messages first so success notes are highly visible
+        if ( ! empty( $result['messages'] ) && is_array( $result['messages'] ) ) {
+            foreach ( $result['messages'] as $message ) {
+                $class = strpos( $message, 'SUCCESS:' ) !== false ? 'notice-success' : 'notice-info';
+                echo '<div class="notice ' . esc_attr( $class ) . '"><p><strong>' . esc_html( (string) $message ) . '</strong></p></div>';
+            }
         }
 
         $status       = isset( $result['status'] ) ? $result['status'] : 'error';
@@ -92,7 +132,7 @@ class OWSC_SKU_Audit_Admin {
         echo '<h2>WooCommerce exact-SKU discovery</h2><p><strong>Exact WooCommerce SKU matches:</strong> ' . count( $woo_products ) . '</p>';
 
         if ( 1 === count( $woo_products ) ) {
-            echo '<p><strong>Mapping status:</strong> Valid exact-SKU match. Read-only discovery only.</p>';
+            echo '<p><strong>Mapping status:</strong> Valid exact-SKU match.</p>';
         } elseif ( 0 === count( $woo_products ) ) {
             echo '<p><strong>Mapping status:</strong> Missing. No WooCommerce product or variation has this exact SKU.</p>';
         } else {
@@ -115,7 +155,7 @@ class OWSC_SKU_Audit_Admin {
             echo '</tbody></table>';
         }
 
-        // --- NEW: Proposed Synchronization Preview ---
+        // --- Proposed Synchronization Preview with Action Button ---
         if ( isset( $result['proposed_qty'] ) && 1 === count( $woo_products ) ) {
             $proposed = $result['proposed_qty'];
             $current  = $woo_products[0]['stock_quantity'];
@@ -130,6 +170,22 @@ class OWSC_SKU_Audit_Admin {
             echo '<td><strong>Update quantity to ' . esc_html( (string) $proposed ) . ' and status to ' . esc_html( $proposed_status ) . '</strong></td>';
             echo '</tr>';
             echo '</tbody></table>';
+
+            // Only show the sync button if quantities are out of sync
+            if ( (float) $proposed !== (float) $current ) {
+                echo '<br><form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" style="display:inline-block; margin-top: 10px; padding: 15px; border: 1px solid #ccd0d4; background: #fff;">';
+                echo '<input type="hidden" name="action" value="owsc_run_sku_sync">';
+                wp_nonce_field( 'owsc_run_sku_sync' );
+                echo '<input type="hidden" name="sku" value="' . esc_attr( $sku ) . '">';
+                echo '<input type="hidden" name="woo_id" value="' . esc_attr( $woo_products[0]['id'] ) . '">';
+                echo '<input type="hidden" name="proposed_qty" value="' . esc_attr( $proposed ) . '">';
+                echo '<input type="hidden" name="proposed_status" value="' . esc_attr( $proposed_status ) . '">';
+                echo '<p>This will write data to WooCommerce immediately.</p>';
+                submit_button( 'Execute Sync to WooCommerce', 'primary', 'submit', false );
+                echo '</form>';
+            } else {
+                echo '<br><div class="notice notice-success inline" style="margin-top: 15px;"><p><strong>WooCommerce is already in sync with Odoo for this SKU.</strong></p></div>';
+            }
         }
 
         if ( isset( $result['locations'] ) && is_array( $result['locations'] ) ) {
@@ -149,12 +205,6 @@ class OWSC_SKU_Audit_Admin {
                     echo '</tr>';
                 }
                 echo '</tbody></table>';
-            }
-        }
-
-        if ( ! empty( $result['messages'] ) && is_array( $result['messages'] ) ) {
-            foreach ( $result['messages'] as $message ) {
-                echo '<p>' . esc_html( (string) $message ) . '</p>';
             }
         }
     }
