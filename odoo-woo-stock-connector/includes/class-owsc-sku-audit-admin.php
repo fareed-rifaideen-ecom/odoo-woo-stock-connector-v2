@@ -115,6 +115,27 @@ class OWSC_SKU_Audit_Admin {
             echo '</tbody></table>';
         }
 
+        // --- NEW: Render Odoo Locations Table ---
+        if ( isset( $result['locations'] ) && is_array( $result['locations'] ) ) {
+            echo '<h2>Odoo stock by location</h2>';
+            if ( empty( $result['locations'] ) ) {
+                echo '<p>No stock.quant records found for this product.</p>';
+            } else {
+                echo '<table class="widefat striped"><thead><tr><th>Location ID</th><th>Complete location name</th><th>Usage type</th><th>On hand</th><th>Reserved</th><th>Available</th></tr></thead><tbody>';
+                foreach ( $result['locations'] as $loc ) {
+                    echo '<tr>';
+                    echo '<td>' . esc_html( (string) $loc['location_id'] ) . '</td>';
+                    echo '<td>' . esc_html( (string) $loc['complete_name'] ) . '</td>';
+                    echo '<td>' . esc_html( (string) $loc['usage'] ) . '</td>';
+                    echo '<td>' . esc_html( (string) $loc['quantity'] ) . '</td>';
+                    echo '<td>' . esc_html( (string) $loc['reserved'] ) . '</td>';
+                    echo '<td><strong>' . esc_html( (string) $loc['available'] ) . '</strong></td>';
+                    echo '</tr>';
+                }
+                echo '</tbody></table>';
+            }
+        }
+
         if ( ! empty( $result['messages'] ) && is_array( $result['messages'] ) ) {
             foreach ( $result['messages'] as $message ) {
                 echo '<p>' . esc_html( (string) $message ) . '</p>';
