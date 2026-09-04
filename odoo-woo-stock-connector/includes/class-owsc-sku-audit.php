@@ -16,6 +16,7 @@ class OWSC_SKU_Audit {
             'fields'               => array(),
             'odoo_products'        => array(),
             'woocommerce_products' => array(),
+            'locations'            => array(), // New array to hold stock data
             'messages'             => array(),
         );
 
@@ -31,7 +32,7 @@ class OWSC_SKU_Audit {
             return array_merge( $result, array( 'status' => 'error', 'messages' => array( 'Odoo authentication failed.' ) ) );
         }
 
-        // Check if the eligibility field exists in Odoo
+        // Check eligibility field
         $fields = $client->execute_kw( $config['database'], $uid, $config['api_key'], 'product.product', 'fields_get', array(), array( 'attributes' => array( 'string', 'type' ) ) );
         
         // Search Odoo for the exact SKU
@@ -52,6 +53,68 @@ class OWSC_SKU_Audit {
         if ( 1 !== count( $result['woocommerce_products'] ) ) {
             $result['status'] = 'warning';
             $result['messages'][] = 'WooCommerce SKU must resolve to exactly one product or variation before synchronization is considered.';
+        }
+
+        // --- NEW: Read-only stock.quant discovery ---
+        // Only proceed to check stock if we have a perfect 1-to-1 match
+        if ( 1 === count( $result['odoo_products'] ) && 1 === count( $result['woocommerce_products'] ) ) {
+            $odoo_product_id = $result['odoo_products'][0]['id'];
+
+            // 1. Get the stock quants for this product
+            $quants = $client->execute_kw( 
+                $config['database'], $uid, $config['api_key'], 
+                'stock.quant', 'search_read', 
+                array( array( array( 'product_id', '=', $odoo_product_id ) ) ), 
+                array( 'fields' => array( 'location_id', 'quantity', 'reserved_quantity' ) ) 
+            );
+
+            if ( ! is_wp_error( $quants ) && is_array( $quants ) ) {
+                $location_ids = array();
+                foreach ( $quants as $quant ) {
+                    if ( isset( $quant['location_id'][0] ) ) {
+                        $location_ids[] = $quant['location_id'][0];
+                    }
+                }
+                $location_ids = array_unique( $location_ids );
+
+                $locations_data = array();
+                
+                // 2. Resolve the location IDs to get names and usage types
+                if ( ! empty( $location_ids ) ) {
+                    $locations = $client->execute_kw( 
+                        $config['database'], $uid, $config['api_key'], 
+                        'stock.location', 'search_read', 
+                        array( array( array( 'id', 'in', array_values( $location_ids ) ) ) ), 
+                        array( 'fields' => array( 'id', 'complete_name', 'usage' ) ) 
+                    );
+
+                    if ( ! is_wp_error( $locations ) && is_array( $locations ) ) {
+                        $loc_map = array();
+                        foreach ( $locations as $loc ) {
+                            $loc_map[ $loc['id'] ] = $loc;
+                        }
+
+                        // 3. Combine quant data with location details
+                        foreach ( $quants as $quant ) {
+                            $loc_id = $quant['location_id'][0] ?? 0;
+                            if ( $loc_id && isset( $loc_map[ $loc_id ] ) ) {
+                                $qty       = (float) ( $quant['quantity'] ?? 0 );
+                                $reserved  = (float) ( $quant['reserved_quantity'] ?? 0 );
+                                
+                                $locations_data[] = array(
+                                    'location_id'   => $loc_id,
+                                    'complete_name' => $loc_map[ $loc_id ]['complete_name'] ?? 'Unknown',
+                                    'usage'         => $loc_map[ $loc_id ]['usage'] ?? 'Unknown',
+                                    'quantity'      => $qty,
+                                    'reserved'      => $reserved,
+                                    'available'     => $qty - $reserved,
+                                );
+                            }
+                        }
+                    }
+                }
+                $result['locations'] = $locations_data;
+            }
         }
         
         $result['messages'][] = 'Read-only preflight completed. No records were changed.';
