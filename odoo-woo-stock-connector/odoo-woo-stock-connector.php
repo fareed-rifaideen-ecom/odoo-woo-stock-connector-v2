@@ -16,6 +16,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'OWSC_VERSION', '2.1.0' );
 define( 'OWSC_FILE', __FILE__ );
+define( 'OWSC_DIR', plugin_dir_path( __FILE__ ) );
+
+// Load the XML-RPC client dependency
+require_once OWSC_DIR . 'includes/class-owsc-odoo-xmlrpc-client.php';
 
 final class OWSCPluginV2 {
     const OPTION_NAME = 'owsc_odoo_settings';
