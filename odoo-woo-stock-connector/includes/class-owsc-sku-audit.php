@@ -173,4 +173,21 @@ class OWSC_SKU_Audit {
         }
         return $products;
     }
+
+    public function sync_stock( string $sku, int $woo_product_id, float $new_qty, string $new_status ): array {
+        $product = wc_get_product( $woo_product_id );
+        
+        if ( ! $product ) {
+            return array( 'status' => 'error', 'message' => 'Sync failed: WooCommerce product not found.' );
+        }
+
+        // Update the quantity and status in WooCommerce
+        wc_update_product_stock( $product, $new_qty );
+        wc_update_product_stock_status( $woo_product_id, $new_status );
+
+        return array( 
+            'status'  => 'success', 
+            'message' => sprintf( 'SUCCESS: Stock for SKU %s has been manually synchronized to %d (%s).', $sku, $new_qty, $new_status ) 
+        );
+    }
 }
