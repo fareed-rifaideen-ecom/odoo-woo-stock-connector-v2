@@ -27,7 +27,7 @@ class OWSC_SKU_Audit_Admin {
 
         $result = get_transient( 'owsc_sku_audit_' . get_current_user_id() );
         delete_transient( 'owsc_sku_audit_' . get_current_user_id() );
-        $sku = isset( $_GET['sku'] ) ? sanitize_text_field( wp_unslash( $_GET['sku'] ) ) : '96522-8109'; // Default pilot SKU
+        $sku = isset( $_GET['sku'] ) ? sanitize_text_field( wp_unslash( $_GET['sku'] ) ) : '96522-8109'; 
 
         ?>
         <div class="wrap">
@@ -115,9 +115,25 @@ class OWSC_SKU_Audit_Admin {
             echo '</tbody></table>';
         }
 
-        // --- NEW: Render Odoo Locations Table ---
+        // --- NEW: Proposed Synchronization Preview ---
+        if ( isset( $result['proposed_qty'] ) && 1 === count( $woo_products ) ) {
+            $proposed = $result['proposed_qty'];
+            $current  = $woo_products[0]['stock_quantity'];
+            $proposed_status = $proposed > 0 ? 'instock' : 'outofstock';
+            
+            echo '<h2>Proposed Synchronization Preview</h2>';
+            echo '<table class="widefat striped"><thead><tr><th>Approved Odoo Locations</th><th>Calculated Odoo Stock</th><th>Current WooCommerce Stock</th><th>Proposed Action</th></tr></thead><tbody>';
+            echo '<tr>';
+            echo '<td>WH/Stock, MC/Stock, JM/Stock</td>';
+            echo '<td>' . esc_html( (string) $proposed ) . '</td>';
+            echo '<td>' . esc_html( null === $current ? 'Not managed' : (string) $current ) . '</td>';
+            echo '<td><strong>Update quantity to ' . esc_html( (string) $proposed ) . ' and status to ' . esc_html( $proposed_status ) . '</strong></td>';
+            echo '</tr>';
+            echo '</tbody></table>';
+        }
+
         if ( isset( $result['locations'] ) && is_array( $result['locations'] ) ) {
-            echo '<h2>Odoo stock by location</h2>';
+            echo '<h2>Raw Odoo stock by location</h2>';
             if ( empty( $result['locations'] ) ) {
                 echo '<p>No stock.quant records found for this product.</p>';
             } else {
