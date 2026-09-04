@@ -17,6 +17,7 @@ class OWSC_SKU_Audit {
             'odoo_products'        => array(),
             'woocommerce_products' => array(),
             'locations'            => array(),
+            'proposed_qty'         => null,
             'messages'             => array(),
         );
 
@@ -92,6 +93,8 @@ class OWSC_SKU_Audit {
                 }
 
                 $locations_data = array();
+                $proposed_qty = 0;
+                $approved_locations = array( 'WH/Stock', 'MC/Stock', 'JM/Stock' );
                 
                 // 2. Resolve the location IDs to get names and usage types
                 if ( ! empty( $location_ids ) ) {
@@ -108,17 +111,25 @@ class OWSC_SKU_Audit {
                             $loc_map[ $loc['id'] ] = $loc;
                         }
 
-                        // 3. Format the final aggregated location data
+                        // 3. Format the final aggregated location data and calculate proposed quantity
                         foreach ( $aggregated_quants as $loc_id => $totals ) {
                             if ( isset( $loc_map[ $loc_id ] ) ) {
+                                $complete_name = $loc_map[ $loc_id ]['complete_name'] ?? 'Unknown';
+                                $available = $totals['quantity'] - $totals['reserved'];
+                                
                                 $locations_data[] = array(
                                     'location_id'   => $loc_id,
-                                    'complete_name' => $loc_map[ $loc_id ]['complete_name'] ?? 'Unknown',
+                                    'complete_name' => $complete_name,
                                     'usage'         => $loc_map[ $loc_id ]['usage'] ?? 'Unknown',
                                     'quantity'      => $totals['quantity'],
                                     'reserved'      => $totals['reserved'],
-                                    'available'     => $totals['quantity'] - $totals['reserved'],
+                                    'available'     => $available,
                                 );
+
+                                // Only sum approved locations for the website
+                                if ( in_array( $complete_name, $approved_locations, true ) ) {
+                                    $proposed_qty += $available;
+                                }
                             }
                         }
                         
@@ -126,6 +137,9 @@ class OWSC_SKU_Audit {
                         usort($locations_data, function($a, $b) {
                             return strcmp($a['complete_name'], $b['complete_name']);
                         });
+                        
+                        // Prevent negative stock publication
+                        $result['proposed_qty'] = max( 0, $proposed_qty );
                     }
                 }
                 $result['locations'] = $locations_data;
