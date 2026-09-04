@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+wp-config.php
+wp-content/debug.log
+/vendor/
+/node_modules/
