@@ -3,7 +3,7 @@
  * Plugin Name: Odoo WooCommerce Stock Connector V2
  * Plugin URI: https://github.com/fareed-rifaideen-ecom/odoo-woo-stock-connector-v2
  * Description: V2 foundation for a secure Odoo 18 and WooCommerce inventory connector.
- * Version: 2.2.0
+ * Version: 2.3.0
  * Author: Fareed M. Rifaideen
  * Author URI: https://fareed-rifaideen.netlify.app/
  * Requires PHP: 7.4
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OWSC_VERSION', '2.2.0' );
+define( 'OWSC_VERSION', '2.3.0' );
 define( 'OWSC_FILE', __FILE__ );
 define( 'OWSC_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -24,7 +24,7 @@ require_once OWSC_DIR . 'includes/class-owsc-connection-test.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit-admin.php';
 require_once OWSC_DIR . 'includes/class-owsc-stock-sync.php';
-require_once OWSC_DIR . 'includes/class-owsc-order-import.php'; // NEW: Load Order Import
+require_once OWSC_DIR . 'includes/class-owsc-order-import.php';
 
 final class OWSCPluginV2 {
     const OPTION_NAME = 'owsc_odoo_settings';
@@ -40,7 +40,7 @@ final class OWSCPluginV2 {
         OWSC_Connection_Test::instance()->register();
         new OWSC_SKU_Audit_Admin();
 
-        // NEW: Register the WooCommerce Order Event capture
+        // Register the WooCommerce Order Event capture
         if ( class_exists( 'OWSC_Order_Import' ) ) {
             ( new OWSC_Order_Import() )->register();
         }
@@ -59,6 +59,7 @@ final class OWSCPluginV2 {
             'api_key'       => (string) ( $settings['api_key'] ?? '' ),
             'sync_enabled'  => (string) ( $settings['sync_enabled'] ?? 'no' ),
             'sync_interval' => (string) ( $settings['sync_interval'] ?? 'hourly' ),
+            'auto_confirm'  => (string) ( $settings['auto_confirm'] ?? 'no' ), // NEW: Auto-confirm toggle
         );
     }
 
@@ -100,7 +101,7 @@ final class OWSCPluginV2 {
                 </div>
             <?php endif; ?>
 
-            <p><strong>Phase:</strong> Automated Synchronization Configuration.</p>
+            <p><strong>Phase:</strong> Automated Synchronization & Order Configuration.</p>
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
                 <input type="hidden" name="action" value="owsc_save_settings">
                 <?php wp_nonce_field( 'owsc_save_settings' ); ?>
@@ -125,7 +126,7 @@ final class OWSCPluginV2 {
                         </td>
                     </tr>
                     <tr>
-                        <th scope="row"><label for="sync_enabled">Automated Sync</label></th>
+                        <th scope="row"><label for="sync_enabled">Automated Stock Sync</label></th>
                         <td>
                             <label>
                                 <input type="checkbox" name="sync_enabled" id="sync_enabled" value="yes" <?php checked( $config['sync_enabled'], 'yes' ); ?>>
@@ -134,14 +135,23 @@ final class OWSCPluginV2 {
                         </td>
                     </tr>
                     <tr>
-                        <th scope="row"><label for="sync_interval">Sync Interval</label></th>
+                        <th scope="row"><label for="sync_interval">Stock Sync Interval</label></th>
                         <td>
                             <select name="sync_interval" id="sync_interval">
                                 <option value="hourly" <?php selected( $config['sync_interval'], 'hourly' ); ?>>Hourly</option>
                                 <option value="twicedaily" <?php selected( $config['sync_interval'], 'twicedaily' ); ?>>Twice Daily (Every 12 hours)</option>
                                 <option value="daily" <?php selected( $config['sync_interval'], 'daily' ); ?>>Daily</option>
                             </select>
-                            <p class="description">How often the plugin should fetch stock updates from Odoo.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="auto_confirm">Order Import Rules</label></th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="auto_confirm" id="auto_confirm" value="yes" <?php checked( $config['auto_confirm'], 'yes' ); ?>>
+                                <strong>Enable Warehouse Routing & Auto-Confirmation</strong>
+                            </label>
+                            <p class="description">If checked, the plugin will calculate stock and confirm the order in the best warehouse. If unchecked, all imports will be placed in the default warehouse as Draft Quotations.</p>
                         </td>
                     </tr>
                 </table>
@@ -175,6 +185,7 @@ final class OWSCPluginV2 {
         $submitted_key = isset( $_POST['api_key'] ) ? trim( (string) wp_unslash( $_POST['api_key'] ) ) : '';
         
         $sync_enabled = isset( $_POST['sync_enabled'] ) ? 'yes' : 'no';
+        $auto_confirm = isset( $_POST['auto_confirm'] ) ? 'yes' : 'no';
         $allowed_intervals = array( 'hourly', 'twicedaily', 'daily' );
         $sync_interval = in_array( $_POST['sync_interval'] ?? '', $allowed_intervals, true ) ? sanitize_text_field( wp_unslash( $_POST['sync_interval'] ) ) : 'hourly';
 
@@ -185,6 +196,7 @@ final class OWSCPluginV2 {
             'api_key'       => $submitted_key ? $submitted_key : $old_config['api_key'],
             'sync_enabled'  => $sync_enabled,
             'sync_interval' => $sync_interval,
+            'auto_confirm'  => $auto_confirm, // NEW
         );
 
         update_option( self::OPTION_NAME, $new_config, false );
