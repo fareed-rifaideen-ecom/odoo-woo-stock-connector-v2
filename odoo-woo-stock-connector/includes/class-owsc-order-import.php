@@ -66,7 +66,7 @@ class OWSC_Order_Import {
         // Step A: Resolve Customer
         $partner_id = $this->resolve_customer( $client, $config, $uid, $customer_data );
         if ( ! $partner_id ) {
-            $order->add_order_note( 'Odoo Connector Exception: Could not resolve or create customer in Odoo.' );
+            $order->add_order_note( 'Odoo Connector Exception: Could not resolve or create customer in Odoo. Check required fields.' );
             return;
         }
 
@@ -162,14 +162,37 @@ class OWSC_Order_Import {
         }
 
         // Priority 3: Create new Contact if no match found
+        
+        // Lookup the "Online Order" tag ID to satisfy the custom requirement
+        $tag_ids = array();
+        $tags = $client->execute_kw( 
+            $config['database'], $uid, $config['api_key'], 
+            'res.partner.category', 'search_read', 
+            array( array( array( 'name', '=', 'Online Order' ) ) ), 
+            array( 'fields' => array( 'id' ), 'limit' => 1 ) 
+        );
+        if ( ! is_wp_error( $tags ) && ! empty( $tags ) ) {
+            $tag_ids[] = (int) $tags[0]['id'];
+        }
+
+        // Prepare the partner payload, filling both phone and mobile
+        $partner_payload = array(
+            'name'   => ! empty( $customer_data['name'] ) ? $customer_data['name'] : 'WooCommerce Guest',
+            'email'  => $customer_data['email'],
+            'phone'  => $customer_data['phone'],
+            'mobile' => $customer_data['phone'], // Fulfills the custom Mobile requirement
+        );
+
+        // Append the Tags requirement if the tag was found
+        if ( ! empty( $tag_ids ) ) {
+            // Odoo Many2many assignment syntax: array( 6, 0, array_of_ids )
+            $partner_payload['category_id'] = array( array( 6, 0, $tag_ids ) ); 
+        }
+
         $new_partner_id = $client->execute_kw( 
             $config['database'], $uid, $config['api_key'], 
             'res.partner', 'create', 
-            array( array(
-                'name'  => ! empty( $customer_data['name'] ) ? $customer_data['name'] : 'WooCommerce Guest',
-                'email' => $customer_data['email'],
-                'phone' => $customer_data['phone'],
-            ) ) 
+            array( $partner_payload ) 
         );
 
         if ( ! is_wp_error( $new_partner_id ) && is_int( $new_partner_id ) ) {
