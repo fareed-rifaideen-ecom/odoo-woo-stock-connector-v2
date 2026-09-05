@@ -189,7 +189,7 @@ class OWSC_Order_Import {
             }
             
             $order_lines[] = array(
-                0, // Odoo command: Create new record
+                0, 
                 0,
                 array(
                     'product_id'      => $odoo_product_map[ $item['sku'] ],
@@ -199,13 +199,30 @@ class OWSC_Order_Import {
             );
         }
 
-        // Step E: Create Sale Order
+        // --- NEW: Step E: Get the "Online Order" tag for the Sales Order ---
+        $sale_tag_ids = array();
+        $sale_tags = $client->execute_kw( 
+            $config['database'], $uid, $config['api_key'], 
+            'crm.tag', 'search_read', 
+            array( array( array( 'name', '=', 'Online Order' ) ) ), 
+            array( 'fields' => array( 'id' ), 'limit' => 1 ) 
+        );
+        if ( ! is_wp_error( $sale_tags ) && ! empty( $sale_tags ) ) {
+            $sale_tag_ids[] = (int) $sale_tags[0]['id'];
+        }
+
+        // Step F: Create Sale Order
         $sale_order_data = array(
             'partner_id'       => $partner_id,
             'warehouse_id'     => $target_warehouse_id,
             'client_order_ref' => 'WOO-' . $order->get_id(),
             'order_line'       => $order_lines,
         );
+
+        // Apply the tag to the quotation payload if we found it
+        if ( ! empty( $sale_tag_ids ) ) {
+            $sale_order_data['tag_ids'] = array( array( 6, 0, $sale_tag_ids ) );
+        }
 
         $sale_order_id = $client->execute_kw( 
             $config['database'], $uid, $config['api_key'], 
@@ -218,7 +235,7 @@ class OWSC_Order_Import {
             return;
         }
 
-        // Step F: Execute Auto-Confirmation (If enabled and valid)
+        // Step G: Execute Auto-Confirmation (If enabled and valid)
         if ( $is_auto_confirm_enabled && $can_auto_confirm ) {
             $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
