@@ -55,6 +55,8 @@ class OWSC_Order_Import {
             return;
         }
 
+        $is_auto_confirm_enabled = ( $config['auto_confirm'] === 'yes' );
+
         $client = new OWSC_Odoo_XMLRPC_Client( $config['url'] );
         $uid    = $client->authenticate( $config['database'], $config['username'], $config['api_key'] );
         
@@ -113,8 +115,8 @@ class OWSC_Order_Import {
         $can_auto_confirm    = false;
         $target_code         = '';
 
-        if ( ! empty( $location_ids ) && ! empty( $odoo_product_map ) ) {
-            // Check stock quants for our specific products in our 3 specific locations
+        // Only run routing calculation if auto-confirm toggle is checked
+        if ( $is_auto_confirm_enabled && ! empty( $location_ids ) && ! empty( $odoo_product_map ) ) {
             $quants = $client->execute_kw(
                 $config['database'], $uid, $config['api_key'],
                 'stock.quant', 'search_read',
@@ -162,17 +164,20 @@ class OWSC_Order_Import {
                         $target_warehouse_id = $wh_id;
                         $can_auto_confirm    = true;
                         $target_code         = $code;
-                        break; // Stop checking, we found our warehouse!
+                        break;
                     }
                 }
             }
         }
 
-        // Fallback if no single warehouse can fulfill
+        // Fallback or if auto-confirm is toggled OFF
         if ( ! $target_warehouse_id ) {
             $target_warehouse_id = $wh_map['WH']['id'] ?? ( $warehouses[0]['id'] ?? 1 );
             $can_auto_confirm    = false;
-            $order->add_order_note( 'Odoo Connector Notice: Stock is split across multiple locations or unavailable. Order requires manual review in Odoo.' );
+            $target_code         = 'WH (Default)';
+            if ( $is_auto_confirm_enabled ) {
+                $order->add_order_note( 'Odoo Connector Notice: Stock split across multiple locations or unavailable. Routed to default warehouse for manual review.' );
+            }
         }
 
         // Step D: Build Order Lines
@@ -213,8 +218,8 @@ class OWSC_Order_Import {
             return;
         }
 
-        // Step F: Execute Auto-Confirmation
-        if ( $can_auto_confirm ) {
+        // Step F: Execute Auto-Confirmation (If enabled and valid)
+        if ( $is_auto_confirm_enabled && $can_auto_confirm ) {
             $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
                 'sale.order', 'action_confirm', 
@@ -222,7 +227,7 @@ class OWSC_Order_Import {
             );
             $order->add_order_note( sprintf( 'Odoo Connector Success: Created and Auto-Confirmed Sale Order ID %d in Odoo (Routed to %s).', $sale_order_id, $target_code ) );
         } else {
-            $order->add_order_note( sprintf( 'Odoo Connector Success: Created Draft Sale Order ID %d in Odoo. Pending manual confirmation.', $sale_order_id ) );
+            $order->add_order_note( sprintf( 'Odoo Connector Success: Created Draft Sale Order ID %d in Odoo (Routed to %s). Pending manual confirmation.', $sale_order_id, $target_code ) );
         }
 
         // Mark completed
