@@ -17,29 +17,37 @@ class OWSC_Stock_Sync {
             return array( 'status' => 'error', 'message' => 'Odoo authentication failed. Cannot run sync.' );
         }
 
-        // 1. Fetch all Odoo products marked as eligible for WooCommerce sync
+        // 1. Fetch eligible Odoo products (Now including product_tmpl_id for pricelist matching)
         $products = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
             'product.product', 'search_read',
             array( array( array( 'x_studio_available_for_woocommerce_sync', '=', true ) ) ),
-            array( 'fields' => array( 'id', 'default_code' ) )
+            array( 'fields' => array( 'id', 'default_code', 'product_tmpl_id' ) )
         );
 
         if ( is_wp_error( $products ) || ! is_array( $products ) || empty( $products ) ) {
             return array( 'status' => 'info', 'message' => 'No eligible products found for sync in Odoo.' );
         }
 
-        $product_map = array(); 
+        $product_map      = array(); 
         $odoo_product_ids = array();
+        $odoo_tmpl_ids    = array();
+        $tmpl_to_sku_map  = array();
         
         foreach ( $products as $p ) {
             if ( ! empty( $p['default_code'] ) ) {
-                $product_map[ $p['id'] ] = trim( $p['default_code'] );
+                $sku = trim( $p['default_code'] );
+                $product_map[ $p['id'] ] = $sku;
                 $odoo_product_ids[] = $p['id'];
+                
+                if ( isset( $p['product_tmpl_id'][0] ) ) {
+                    $odoo_tmpl_ids[] = $p['product_tmpl_id'][0];
+                    $tmpl_to_sku_map[ $p['product_tmpl_id'][0] ] = $sku;
+                }
             }
         }
 
-        // 2. Fetch the specific IDs for WH, MC, and JM locations
+        // 2. Fetch specific IDs for WH, MC, and JM locations
         $approved_locations = array( 'WH/Stock', 'MC/Stock', 'JM/Stock' );
         $locations = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
@@ -48,13 +56,9 @@ class OWSC_Stock_Sync {
             array( 'fields' => array( 'id', 'complete_name' ) )
         );
 
-        if ( is_wp_error( $locations ) || empty( $locations ) ) {
-            return array( 'status' => 'error', 'message' => 'Could not find approved warehouse locations (WH, MC, JM) in Odoo.' );
-        }
+        $location_ids = array_column( (array) $locations, 'id' );
 
-        $location_ids = array_column( $locations, 'id' );
-
-        // 3. Fetch Stock Quants for eligible products in approved locations
+        // 3. Fetch Stock Quants
         $quants = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
             'stock.quant', 'search_read',
@@ -81,7 +85,7 @@ class OWSC_Stock_Sync {
             }
         }
 
-        // 3.5 Dynamic Subtraction for Unconfirmed WooCommerce Draft Quotations
+        // 3.5 Dynamic Subtraction for Unconfirmed Drafts
         $tag_ids = array();
         $tags = $client->execute_kw( 
             $config['database'], $uid, $config['api_key'], 
@@ -94,9 +98,6 @@ class OWSC_Stock_Sync {
             $tag_ids[] = (int) $tags[0]['id'];
         }
 
-        $drafts_found = 0; // Diagnostic counter
-
-        // Execute deduction only if the tag was successfully located in Odoo
         if ( ! empty( $tag_ids ) ) {
             $draft_orders = $client->execute_kw(
                 $config['database'], $uid, $config['api_key'],
@@ -104,15 +105,13 @@ class OWSC_Stock_Sync {
                 array( array(
                     array( 'state', 'in', array( 'draft', 'sent' ) ),
                     array( 'tag_ids', 'in', $tag_ids ),
-                    array( 'client_order_ref', 'ilike', 'WOO-' ) // FIXED: Removed the % wildcard to prevent API search errors
+                    array( 'client_order_ref', 'ilike', 'WOO-' ) 
                 ) ),
                 array( 'fields' => array( 'id' ) )
             );
 
             if ( ! is_wp_error( $draft_orders ) && is_array( $draft_orders ) && ! empty( $draft_orders ) ) {
                 $draft_order_ids = array_column( $draft_orders, 'id' );
-                $drafts_found = count( $draft_order_ids );
-
                 $draft_lines = $client->execute_kw(
                     $config['database'], $uid, $config['api_key'],
                     'sale.order.line', 'search_read',
@@ -129,8 +128,6 @@ class OWSC_Stock_Sync {
                         if ( isset( $product_map[ $pid ] ) ) {
                             $sku = $product_map[ $pid ];
                             $draft_qty = (float) ( $line['product_uom_qty'] ?? 0 );
-                            
-                            // Deduct the draft quantity from the available stock
                             $stock_totals[ $sku ] -= $draft_qty;
                         }
                     }
@@ -138,9 +135,43 @@ class OWSC_Stock_Sync {
             }
         }
 
+        // --- NEW: 3.8 Fetch Prices from Target Pricelist ---
+        $sku_prices = array();
+        if ( $config['sync_price'] === 'yes' && ! empty( $config['pricelist_name'] ) ) {
+            $pricelist_items = $client->execute_kw(
+                $config['database'], $uid, $config['api_key'],
+                'product.pricelist.item', 'search_read',
+                array( array(
+                    array( 'pricelist_id.name', '=', $config['pricelist_name'] ),
+                    '|',
+                    array( 'product_id', 'in', $odoo_product_ids ),
+                    array( 'product_tmpl_id', 'in', $odoo_tmpl_ids )
+                ) ),
+                array( 'fields' => array( 'product_id', 'product_tmpl_id', 'fixed_price' ) )
+            );
+
+            if ( ! is_wp_error( $pricelist_items ) && is_array( $pricelist_items ) ) {
+                foreach ( $pricelist_items as $item ) {
+                    $price = (float) $item['fixed_price'];
+                    if ( $price <= 0 ) continue;
+
+                    // Match variant-specific rule first, or fallback to template rule
+                    if ( ! empty( $item['product_id'][0] ) && isset( $product_map[ $item['product_id'][0] ] ) ) {
+                        $sku = $product_map[ $item['product_id'][0] ];
+                        $sku_prices[ $sku ] = $price;
+                    } elseif ( ! empty( $item['product_tmpl_id'][0] ) && isset( $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ] ) ) {
+                        $sku = $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ];
+                        if ( ! isset( $sku_prices[ $sku ] ) ) {
+                            $sku_prices[ $sku ] = $price;
+                        }
+                    }
+                }
+            }
+        }
+
         // 4. Update WooCommerce
-        $updated_count = 0;
-        $not_found_count = 0;
+        $updated_stock_count = 0;
+        $updated_price_count = 0;
 
         foreach ( $stock_totals as $sku => $qty ) {
             $final_qty = max( 0, $qty ); 
@@ -149,22 +180,37 @@ class OWSC_Stock_Sync {
             $woo_product_id = wc_get_product_id_by_sku( $sku );
             if ( $woo_product_id ) {
                 $product = wc_get_product( $woo_product_id );
-                if ( $product && $product->get_manage_stock() ) {
-                    if ( (float) $product->get_stock_quantity() !== (float) $final_qty ) {
-                        wc_update_product_stock( $product, $final_qty );
-                        wc_update_product_stock_status( $woo_product_id, $status );
-                        $updated_count++;
+                if ( $product ) {
+                    $product_changed = false;
+
+                    // Update Stock
+                    if ( $product->get_manage_stock() && (float) $product->get_stock_quantity() !== (float) $final_qty ) {
+                        $product->set_stock_quantity( $final_qty );
+                        $product->set_stock_status( $status );
+                        $updated_stock_count++;
+                        $product_changed = true;
+                    }
+
+                    // Update Price (If enabled and a valid price was found in Odoo)
+                    if ( $config['sync_price'] === 'yes' && isset( $sku_prices[ $sku ] ) ) {
+                        if ( (float) $product->get_regular_price() !== (float) $sku_prices[ $sku ] ) {
+                            $product->set_regular_price( $sku_prices[ $sku ] );
+                            $updated_price_count++;
+                            $product_changed = true;
+                        }
+                    }
+
+                    // Save if modified
+                    if ( $product_changed ) {
+                        $product->save();
                     }
                 }
-            } else {
-                $not_found_count++;
             }
         }
 
-        // NEW: Output exactly how many drafts were found for subtraction
         return array(
             'status'  => 'success',
-            'message' => sprintf( 'Bulk sync complete. Found %d unconfirmed web drafts for subtraction. %d WooCommerce products updated successfully.', $drafts_found, $updated_count )
+            'message' => sprintf( 'Sync complete. Updated Stock for %d items. Updated Prices for %d items.', $updated_stock_count, $updated_price_count )
         );
     }
 }
