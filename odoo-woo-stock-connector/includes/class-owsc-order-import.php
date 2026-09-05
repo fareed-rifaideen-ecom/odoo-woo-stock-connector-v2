@@ -10,7 +10,7 @@ class OWSC_Order_Import {
         add_action( 'woocommerce_order_status_processing', array( $this, 'capture_processing_order' ), 10, 2 );
     }
 
-    public function capture_processing_order( int $order_id, clone $order ): void {
+    public function capture_processing_order( int $order_id, \WC_Order $order ): void {
         // 1. Idempotency Check: Prevent processing the same order twice
         $import_status = $order->get_meta( '_owsc_odoo_import_status' );
         if ( 'processing' === $import_status || 'completed' === $import_status ) {
