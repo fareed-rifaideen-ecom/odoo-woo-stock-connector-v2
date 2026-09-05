@@ -3,7 +3,7 @@
  * Plugin Name: Odoo WooCommerce Stock Connector V2
  * Plugin URI: https://github.com/fareed-rifaideen-ecom/odoo-woo-stock-connector-v2
  * Description: V2 foundation for a secure Odoo 18 and WooCommerce inventory connector.
- * Version: 2.5.0
+ * Version: 2.6.0
  * Author: Fareed M. Rifaideen
  * Author URI: https://fareed-rifaideen.netlify.app/
  * Requires PHP: 7.4
@@ -14,11 +14,10 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OWSC_VERSION', '2.5.0' );
+define( 'OWSC_VERSION', '2.6.0' );
 define( 'OWSC_FILE', __FILE__ );
 define( 'OWSC_DIR', plugin_dir_path( __FILE__ ) );
 
-// Load dependencies
 require_once OWSC_DIR . 'includes/class-owsc-odoo-xmlrpc-client.php';
 require_once OWSC_DIR . 'includes/class-owsc-connection-test.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit.php';
@@ -56,15 +55,15 @@ final class OWSCPluginV2 {
     public static function configuration(): array {
         $settings = get_option( self::OPTION_NAME, array() );
         return array(
-            'url'            => (string) ( $settings['url'] ?? '' ),
-            'database'       => (string) ( $settings['database'] ?? '' ),
-            'username'       => (string) ( $settings['username'] ?? '' ),
-            'api_key'        => (string) ( $settings['api_key'] ?? '' ),
-            'sync_enabled'   => (string) ( $settings['sync_enabled'] ?? 'no' ),
-            'sync_interval'  => (string) ( $settings['sync_interval'] ?? 'hourly' ),
-            'auto_confirm'   => (string) ( $settings['auto_confirm'] ?? 'no' ),
-            'sync_price'     => (string) ( $settings['sync_price'] ?? 'no' ),
-            'pricelist_name' => (string) ( $settings['pricelist_name'] ?? 'UAE Prices with tax (AED)' ),
+            'url'           => (string) ( $settings['url'] ?? '' ),
+            'database'      => (string) ( $settings['database'] ?? '' ),
+            'username'      => (string) ( $settings['username'] ?? '' ),
+            'api_key'       => (string) ( $settings['api_key'] ?? '' ),
+            'sync_enabled'  => (string) ( $settings['sync_enabled'] ?? 'no' ),
+            'sync_interval' => (string) ( $settings['sync_interval'] ?? 'hourly' ),
+            'auto_confirm'  => (string) ( $settings['auto_confirm'] ?? 'no' ),
+            'sync_price'    => (string) ( $settings['sync_price'] ?? 'no' ),
+            'pricelist_id'  => (int) ( $settings['pricelist_id'] ?? 0 ), // NEW: Uses ID
         );
     }
 
@@ -169,10 +168,10 @@ final class OWSCPluginV2 {
                         </td>
                     </tr>
                     <tr>
-                        <th scope="row"><label for="pricelist_name">Target Pricelist Name</label></th>
+                        <th scope="row"><label for="pricelist_id">Target Pricelist ID</label></th>
                         <td>
-                            <input name="pricelist_name" id="pricelist_name" class="regular-text" type="text" value="<?php echo esc_attr( $config['pricelist_name'] ); ?>">
-                            <p class="description">Must perfectly match the exact name of the Odoo Pricelist (e.g., <code>UAE Prices with tax (AED)</code>).</p>
+                            <input name="pricelist_id" id="pricelist_id" class="small-text" type="number" value="<?php echo esc_attr( $config['pricelist_id'] ? $config['pricelist_id'] : '' ); ?>">
+                            <p class="description">Enter the numeric ID of the Pricelist. <em>(To find it: Open the Pricelist in Odoo and look at the URL for <code>id=XX</code>)</em></p>
                         </td>
                     </tr>
                 </table>
@@ -214,7 +213,7 @@ final class OWSCPluginV2 {
             'sync_interval'  => in_array( $_POST['sync_interval'] ?? '', array( 'hourly', 'twicedaily', 'daily' ), true ) ? sanitize_text_field( wp_unslash( $_POST['sync_interval'] ) ) : 'hourly',
             'auto_confirm'   => isset( $_POST['auto_confirm'] ) ? 'yes' : 'no',
             'sync_price'     => isset( $_POST['sync_price'] ) ? 'yes' : 'no',
-            'pricelist_name' => sanitize_text_field( wp_unslash( $_POST['pricelist_name'] ?? 'UAE Prices with tax (AED)' ) ),
+            'pricelist_id'   => (int) ( $_POST['pricelist_id'] ?? 0 ),
         );
 
         update_option( self::OPTION_NAME, $new_config, false );
