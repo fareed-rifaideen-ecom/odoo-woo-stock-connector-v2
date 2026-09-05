@@ -135,58 +135,45 @@ class OWSC_Stock_Sync {
             }
         }
 
-        // --- NEW: 3.8 Fetch Prices with Strict ID Matching & Diagnostics ---
+        // --- NEW: 3.8 Fetch Prices using Explicit Pricelist ID ---
         $sku_prices = array();
         $pricelist_diagnostic = '';
         
-        if ( $config['sync_price'] === 'yes' && ! empty( $config['pricelist_name'] ) ) {
+        $pricelist_id = isset( $config['pricelist_id'] ) ? (int) $config['pricelist_id'] : 0;
+        
+        if ( $config['sync_price'] === 'yes' && $pricelist_id > 0 ) {
             
-            // Step A: Find the actual ID of the Pricelist first
-            $pricelists = $client->execute_kw(
+            $pricelist_items = $client->execute_kw(
                 $config['database'], $uid, $config['api_key'],
-                'product.pricelist', 'search_read',
-                array( array( array( 'name', '=', trim( $config['pricelist_name'] ) ) ) ),
-                array( 'fields' => array( 'id' ), 'limit' => 1 )
+                'product.pricelist.item', 'search_read',
+                array( array(
+                    array( 'pricelist_id', '=', $pricelist_id ),
+                    '|',
+                    array( 'product_id', 'in', $odoo_product_ids ),
+                    array( 'product_tmpl_id', 'in', $odoo_tmpl_ids )
+                ) ),
+                array( 'fields' => array( 'product_id', 'product_tmpl_id', 'fixed_price' ) )
             );
 
-            if ( is_wp_error( $pricelists ) || empty( $pricelists ) ) {
-                $pricelist_diagnostic = sprintf( ' [Error: Pricelist "%s" not found in Odoo!]', $config['pricelist_name'] );
-            } else {
-                $pricelist_id = $pricelists[0]['id'];
+            if ( ! is_wp_error( $pricelist_items ) && is_array( $pricelist_items ) ) {
+                $pricelist_diagnostic = sprintf( ' [Pricelist ID %d Connected: Found %d price rules]', $pricelist_id, count( $pricelist_items ) );
                 
-                // Step B: Query the rules matching that specific Pricelist ID
-                $pricelist_items = $client->execute_kw(
-                    $config['database'], $uid, $config['api_key'],
-                    'product.pricelist.item', 'search_read',
-                    array( array(
-                        array( 'pricelist_id', '=', $pricelist_id ),
-                        '|',
-                        array( 'product_id', 'in', $odoo_product_ids ),
-                        array( 'product_tmpl_id', 'in', $odoo_tmpl_ids )
-                    ) ),
-                    array( 'fields' => array( 'product_id', 'product_tmpl_id', 'fixed_price' ) )
-                );
+                foreach ( $pricelist_items as $item ) {
+                    $price = isset( $item['fixed_price'] ) ? (float) $item['fixed_price'] : 0;
+                    if ( $price <= 0 ) continue;
 
-                if ( ! is_wp_error( $pricelist_items ) && is_array( $pricelist_items ) ) {
-                    $pricelist_diagnostic = sprintf( ' [Pricelist Connected: Found %d price rules]', count( $pricelist_items ) );
-                    
-                    foreach ( $pricelist_items as $item ) {
-                        $price = isset( $item['fixed_price'] ) ? (float) $item['fixed_price'] : 0;
-                        if ( $price <= 0 ) continue;
-
-                        if ( ! empty( $item['product_id'][0] ) && isset( $product_map[ $item['product_id'][0] ] ) ) {
-                            $sku = $product_map[ $item['product_id'][0] ];
+                    if ( ! empty( $item['product_id'][0] ) && isset( $product_map[ $item['product_id'][0] ] ) ) {
+                        $sku = $product_map[ $item['product_id'][0] ];
+                        $sku_prices[ $sku ] = $price;
+                    } elseif ( ! empty( $item['product_tmpl_id'][0] ) && isset( $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ] ) ) {
+                        $sku = $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ];
+                        if ( ! isset( $sku_prices[ $sku ] ) ) {
                             $sku_prices[ $sku ] = $price;
-                        } elseif ( ! empty( $item['product_tmpl_id'][0] ) && isset( $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ] ) ) {
-                            $sku = $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ];
-                            if ( ! isset( $sku_prices[ $sku ] ) ) {
-                                $sku_prices[ $sku ] = $price;
-                            }
                         }
                     }
-                } else {
-                    $pricelist_diagnostic = ' [Pricelist Connected: But 0 price rules matched the synced products.]';
                 }
+            } else {
+                $pricelist_diagnostic = sprintf( ' [Error: Could not extract rules for Pricelist ID %d]', $pricelist_id );
             }
         }
 
@@ -217,7 +204,7 @@ class OWSC_Stock_Sync {
                         $target_price = (string) $sku_prices[ $sku ];
                         if ( $product->get_regular_price() !== $target_price ) {
                             $product->set_regular_price( $target_price );
-                            $product->set_price( $target_price ); // Force frontend refresh
+                            $product->set_price( $target_price ); 
                             $updated_price_count++;
                             $product_changed = true;
                         }
