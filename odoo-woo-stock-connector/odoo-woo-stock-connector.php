@@ -41,7 +41,9 @@ final class OWSCPluginV2 {
         new OWSC_SKU_Audit_Admin();
 
         // NEW: Register the WooCommerce Order Event capture
-        ( new OWSC_Order_Import() )->register();
+        if ( class_exists( 'OWSC_Order_Import' ) ) {
+            ( new OWSC_Order_Import() )->register();
+        }
     }
 
     public static function deactivate(): void {
