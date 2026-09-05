@@ -66,7 +66,7 @@ class OWSC_Order_Import {
         // Step A: Resolve Customer
         $partner_id = $this->resolve_customer( $client, $config, $uid, $customer_data );
         if ( ! $partner_id ) {
-            $order->add_order_note( 'Odoo Connector Exception: Could not resolve or create customer in Odoo. Check required fields.' );
+            $order->add_order_note( 'Odoo Connector Exception: Could not resolve or create customer in Odoo.' );
             return;
         }
 
@@ -89,7 +89,93 @@ class OWSC_Order_Import {
             $odoo_product_map[ $op['default_code'] ] = $op['id'];
         }
 
-        // Step C: Build Order Lines
+        // Step C: Determine Warehouse Routing
+        $warehouses = $client->execute_kw(
+            $config['database'], $uid, $config['api_key'],
+            'stock.warehouse', 'search_read',
+            array( array( array( 'code', 'in', array( 'WH', 'MC', 'JM' ) ) ) ),
+            array( 'fields' => array( 'id', 'code', 'lot_stock_id' ) )
+        );
+
+        $wh_map       = array();
+        $location_ids = array();
+        
+        if ( ! is_wp_error( $warehouses ) && is_array( $warehouses ) ) {
+            foreach ( $warehouses as $wh ) {
+                $wh_map[ $wh['code'] ] = $wh;
+                if ( isset( $wh['lot_stock_id'][0] ) ) {
+                    $location_ids[] = $wh['lot_stock_id'][0];
+                }
+            }
+        }
+
+        $target_warehouse_id = null;
+        $can_auto_confirm    = false;
+        $target_code         = '';
+
+        if ( ! empty( $location_ids ) && ! empty( $odoo_product_map ) ) {
+            // Check stock quants for our specific products in our 3 specific locations
+            $quants = $client->execute_kw(
+                $config['database'], $uid, $config['api_key'],
+                'stock.quant', 'search_read',
+                array( array(
+                    array( 'product_id', 'in', array_values( $odoo_product_map ) ),
+                    array( 'location_id', 'in', $location_ids )
+                ) ),
+                array( 'fields' => array( 'product_id', 'location_id', 'quantity', 'reserved_quantity' ) )
+            );
+
+            $stock_levels = array();
+            if ( ! is_wp_error( $quants ) && is_array( $quants ) ) {
+                foreach ( $quants as $q ) {
+                    $loc_id  = $q['location_id'][0] ?? 0;
+                    $prod_id = $q['product_id'][0] ?? 0;
+                    $avail   = (float) ($q['quantity'] ?? 0) - (float) ($q['reserved_quantity'] ?? 0);
+
+                    if ( ! isset( $stock_levels[ $loc_id ][ $prod_id ] ) ) {
+                        $stock_levels[ $loc_id ][ $prod_id ] = 0;
+                    }
+                    $stock_levels[ $loc_id ][ $prod_id ] += $avail;
+                }
+            }
+
+            // Evaluate priority: WH -> MC -> JM
+            $priority = array( 'WH', 'MC', 'JM' );
+            foreach ( $priority as $code ) {
+                if ( isset( $wh_map[ $code ] ) ) {
+                    $wh_id  = $wh_map[ $code ]['id'];
+                    $loc_id = $wh_map[ $code ]['lot_stock_id'][0] ?? 0;
+
+                    $can_fulfill_all = true;
+                    foreach ( $items_data as $item ) {
+                        $prod_id = $odoo_product_map[ $item['sku'] ] ?? 0;
+                        $req_qty = $item['quantity'];
+                        $avail   = $stock_levels[ $loc_id ][ $prod_id ] ?? 0;
+
+                        if ( $avail < $req_qty ) {
+                            $can_fulfill_all = false;
+                            break;
+                        }
+                    }
+
+                    if ( $can_fulfill_all ) {
+                        $target_warehouse_id = $wh_id;
+                        $can_auto_confirm    = true;
+                        $target_code         = $code;
+                        break; // Stop checking, we found our warehouse!
+                    }
+                }
+            }
+        }
+
+        // Fallback if no single warehouse can fulfill
+        if ( ! $target_warehouse_id ) {
+            $target_warehouse_id = $wh_map['WH']['id'] ?? ( $warehouses[0]['id'] ?? 1 );
+            $can_auto_confirm    = false;
+            $order->add_order_note( 'Odoo Connector Notice: Stock is split across multiple locations or unavailable. Order requires manual review in Odoo.' );
+        }
+
+        // Step D: Build Order Lines
         $order_lines = array();
         foreach ( $items_data as $item ) {
             if ( ! isset( $odoo_product_map[ $item['sku'] ] ) ) {
@@ -108,10 +194,11 @@ class OWSC_Order_Import {
             );
         }
 
-        // Step D: Create Draft Sale Order
+        // Step E: Create Sale Order
         $sale_order_data = array(
             'partner_id'       => $partner_id,
-            'client_order_ref' => 'WOO-' . $order->get_id(), // Adds WooCommerce Order ID as reference
+            'warehouse_id'     => $target_warehouse_id,
+            'client_order_ref' => 'WOO-' . $order->get_id(),
             'order_line'       => $order_lines,
         );
 
@@ -126,12 +213,22 @@ class OWSC_Order_Import {
             return;
         }
 
-        // Success: Mark completed and attach Odoo ID
+        // Step F: Execute Auto-Confirmation
+        if ( $can_auto_confirm ) {
+            $client->execute_kw( 
+                $config['database'], $uid, $config['api_key'], 
+                'sale.order', 'action_confirm', 
+                array( array( $sale_order_id ) ) 
+            );
+            $order->add_order_note( sprintf( 'Odoo Connector Success: Created and Auto-Confirmed Sale Order ID %d in Odoo (Routed to %s).', $sale_order_id, $target_code ) );
+        } else {
+            $order->add_order_note( sprintf( 'Odoo Connector Success: Created Draft Sale Order ID %d in Odoo. Pending manual confirmation.', $sale_order_id ) );
+        }
+
+        // Mark completed
         $order->update_meta_data( '_owsc_odoo_import_status', 'completed' );
         $order->update_meta_data( '_owsc_odoo_sale_order_id', $sale_order_id );
         $order->save_meta_data();
-
-        $order->add_order_note( sprintf( 'Odoo Connector Success: Created Draft Sale Order ID %d in Odoo.', $sale_order_id ) );
     }
 
     private function resolve_customer( $client, $config, $uid, $customer_data ): int {
@@ -162,8 +259,6 @@ class OWSC_Order_Import {
         }
 
         // Priority 3: Create new Contact if no match found
-        
-        // Lookup the "Online Order" tag ID to satisfy the custom requirement
         $tag_ids = array();
         $tags = $client->execute_kw( 
             $config['database'], $uid, $config['api_key'], 
@@ -175,17 +270,14 @@ class OWSC_Order_Import {
             $tag_ids[] = (int) $tags[0]['id'];
         }
 
-        // Prepare the partner payload, filling both phone and mobile
         $partner_payload = array(
             'name'   => ! empty( $customer_data['name'] ) ? $customer_data['name'] : 'WooCommerce Guest',
             'email'  => $customer_data['email'],
             'phone'  => $customer_data['phone'],
-            'mobile' => $customer_data['phone'], // Fulfills the custom Mobile requirement
+            'mobile' => $customer_data['phone'],
         );
 
-        // Append the Tags requirement if the tag was found
         if ( ! empty( $tag_ids ) ) {
-            // Odoo Many2many assignment syntax: array( 6, 0, array_of_ids )
             $partner_payload['category_id'] = array( array( 6, 0, $tag_ids ) ); 
         }
 
