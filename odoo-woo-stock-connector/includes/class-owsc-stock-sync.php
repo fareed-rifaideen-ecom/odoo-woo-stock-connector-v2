@@ -29,7 +29,7 @@ class OWSC_Stock_Sync {
             return array( 'status' => 'info', 'message' => 'No eligible products found for sync in Odoo.' );
         }
 
-        $product_map = array(); // Map Odoo ID to SKU
+        $product_map = array(); 
         $odoo_product_ids = array();
         
         foreach ( $products as $p ) {
@@ -65,13 +65,11 @@ class OWSC_Stock_Sync {
             array( 'fields' => array( 'product_id', 'quantity', 'reserved_quantity' ) )
         );
 
-        // Initialize all eligible SKUs to 0 stock
         $stock_totals = array(); 
         foreach ( $product_map as $sku ) {
             $stock_totals[ $sku ] = 0;
         }
 
-        // Aggregate available stock
         if ( ! is_wp_error( $quants ) && is_array( $quants ) ) {
             foreach ( $quants as $quant ) {
                 $pid = $quant['product_id'][0] ?? 0;
@@ -83,31 +81,90 @@ class OWSC_Stock_Sync {
             }
         }
 
+        // 3.5 Dynamic Subtraction for Unconfirmed WooCommerce Draft Quotations
+        $tag_ids = array();
+        $tags = $client->execute_kw( 
+            $config['database'], $uid, $config['api_key'], 
+            'crm.tag', 'search_read', 
+            array( array( array( 'name', '=', 'Online Order' ) ) ), 
+            array( 'fields' => array( 'id' ), 'limit' => 1 ) 
+        );
+        
+        if ( ! is_wp_error( $tags ) && ! empty( $tags ) ) {
+            $tag_ids[] = (int) $tags[0]['id'];
+        }
+
+        $drafts_found = 0; // Diagnostic counter
+
+        // Execute deduction only if the tag was successfully located in Odoo
+        if ( ! empty( $tag_ids ) ) {
+            $draft_orders = $client->execute_kw(
+                $config['database'], $uid, $config['api_key'],
+                'sale.order', 'search_read',
+                array( array(
+                    array( 'state', 'in', array( 'draft', 'sent' ) ),
+                    array( 'tag_ids', 'in', $tag_ids ),
+                    array( 'client_order_ref', 'ilike', 'WOO-' ) // FIXED: Removed the % wildcard to prevent API search errors
+                ) ),
+                array( 'fields' => array( 'id' ) )
+            );
+
+            if ( ! is_wp_error( $draft_orders ) && is_array( $draft_orders ) && ! empty( $draft_orders ) ) {
+                $draft_order_ids = array_column( $draft_orders, 'id' );
+                $drafts_found = count( $draft_order_ids );
+
+                $draft_lines = $client->execute_kw(
+                    $config['database'], $uid, $config['api_key'],
+                    'sale.order.line', 'search_read',
+                    array( array(
+                        array( 'order_id', 'in', $draft_order_ids ),
+                        array( 'product_id', 'in', $odoo_product_ids ) 
+                    ) ),
+                    array( 'fields' => array( 'product_id', 'product_uom_qty' ) )
+                );
+
+                if ( ! is_wp_error( $draft_lines ) && is_array( $draft_lines ) ) {
+                    foreach ( $draft_lines as $line ) {
+                        $pid = $line['product_id'][0] ?? 0;
+                        if ( isset( $product_map[ $pid ] ) ) {
+                            $sku = $product_map[ $pid ];
+                            $draft_qty = (float) ( $line['product_uom_qty'] ?? 0 );
+                            
+                            // Deduct the draft quantity from the available stock
+                            $stock_totals[ $sku ] -= $draft_qty;
+                        }
+                    }
+                }
+            }
+        }
+
         // 4. Update WooCommerce
         $updated_count = 0;
         $not_found_count = 0;
 
         foreach ( $stock_totals as $sku => $qty ) {
-            $final_qty = max( 0, $qty ); // Prevent negative stock
+            $final_qty = max( 0, $qty ); 
             $status = $final_qty > 0 ? 'instock' : 'outofstock';
             
             $woo_product_id = wc_get_product_id_by_sku( $sku );
             if ( $woo_product_id ) {
                 $product = wc_get_product( $woo_product_id );
-                // Only update if the product manages stock
                 if ( $product && $product->get_manage_stock() ) {
-                    wc_update_product_stock( $product, $final_qty );
-                    wc_update_product_stock_status( $woo_product_id, $status );
-                    $updated_count++;
+                    if ( (float) $product->get_stock_quantity() !== (float) $final_qty ) {
+                        wc_update_product_stock( $product, $final_qty );
+                        wc_update_product_stock_status( $woo_product_id, $status );
+                        $updated_count++;
+                    }
                 }
             } else {
                 $not_found_count++;
             }
         }
 
+        // NEW: Output exactly how many drafts were found for subtraction
         return array(
             'status'  => 'success',
-            'message' => sprintf( 'Bulk sync complete. %d WooCommerce products updated successfully. %d Odoo products not found in WooCommerce.', $updated_count, $not_found_count )
+            'message' => sprintf( 'Bulk sync complete. Found %d unconfirmed web drafts for subtraction. %d WooCommerce products updated successfully.', $drafts_found, $updated_count )
         );
     }
 }
