@@ -24,6 +24,7 @@ require_once OWSC_DIR . 'includes/class-owsc-connection-test.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit-admin.php';
 require_once OWSC_DIR . 'includes/class-owsc-stock-sync.php';
+require_once OWSC_DIR . 'includes/class-owsc-order-import.php'; // NEW: Load Order Import
 
 final class OWSCPluginV2 {
     const OPTION_NAME = 'owsc_odoo_settings';
@@ -38,6 +39,9 @@ final class OWSCPluginV2 {
         
         OWSC_Connection_Test::instance()->register();
         new OWSC_SKU_Audit_Admin();
+
+        // NEW: Register the WooCommerce Order Event capture
+        ( new OWSC_Order_Import() )->register();
     }
 
     public static function deactivate(): void {
