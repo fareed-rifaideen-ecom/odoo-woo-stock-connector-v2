@@ -17,7 +17,7 @@ class OWSC_Stock_Sync {
             return array( 'status' => 'error', 'message' => 'Odoo authentication failed. Cannot run sync.' );
         }
 
-        // 1. Fetch eligible Odoo products (Now including product_tmpl_id for pricelist matching)
+        // 1. Fetch eligible Odoo products
         $products = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
             'product.product', 'search_read',
@@ -135,36 +135,57 @@ class OWSC_Stock_Sync {
             }
         }
 
-        // --- NEW: 3.8 Fetch Prices from Target Pricelist ---
+        // --- NEW: 3.8 Fetch Prices with Strict ID Matching & Diagnostics ---
         $sku_prices = array();
+        $pricelist_diagnostic = '';
+        
         if ( $config['sync_price'] === 'yes' && ! empty( $config['pricelist_name'] ) ) {
-            $pricelist_items = $client->execute_kw(
+            
+            // Step A: Find the actual ID of the Pricelist first
+            $pricelists = $client->execute_kw(
                 $config['database'], $uid, $config['api_key'],
-                'product.pricelist.item', 'search_read',
-                array( array(
-                    array( 'pricelist_id.name', '=', $config['pricelist_name'] ),
-                    '|',
-                    array( 'product_id', 'in', $odoo_product_ids ),
-                    array( 'product_tmpl_id', 'in', $odoo_tmpl_ids )
-                ) ),
-                array( 'fields' => array( 'product_id', 'product_tmpl_id', 'fixed_price' ) )
+                'product.pricelist', 'search_read',
+                array( array( array( 'name', '=', trim( $config['pricelist_name'] ) ) ) ),
+                array( 'fields' => array( 'id' ), 'limit' => 1 )
             );
 
-            if ( ! is_wp_error( $pricelist_items ) && is_array( $pricelist_items ) ) {
-                foreach ( $pricelist_items as $item ) {
-                    $price = (float) $item['fixed_price'];
-                    if ( $price <= 0 ) continue;
+            if ( is_wp_error( $pricelists ) || empty( $pricelists ) ) {
+                $pricelist_diagnostic = sprintf( ' [Error: Pricelist "%s" not found in Odoo!]', $config['pricelist_name'] );
+            } else {
+                $pricelist_id = $pricelists[0]['id'];
+                
+                // Step B: Query the rules matching that specific Pricelist ID
+                $pricelist_items = $client->execute_kw(
+                    $config['database'], $uid, $config['api_key'],
+                    'product.pricelist.item', 'search_read',
+                    array( array(
+                        array( 'pricelist_id', '=', $pricelist_id ),
+                        '|',
+                        array( 'product_id', 'in', $odoo_product_ids ),
+                        array( 'product_tmpl_id', 'in', $odoo_tmpl_ids )
+                    ) ),
+                    array( 'fields' => array( 'product_id', 'product_tmpl_id', 'fixed_price' ) )
+                );
 
-                    // Match variant-specific rule first, or fallback to template rule
-                    if ( ! empty( $item['product_id'][0] ) && isset( $product_map[ $item['product_id'][0] ] ) ) {
-                        $sku = $product_map[ $item['product_id'][0] ];
-                        $sku_prices[ $sku ] = $price;
-                    } elseif ( ! empty( $item['product_tmpl_id'][0] ) && isset( $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ] ) ) {
-                        $sku = $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ];
-                        if ( ! isset( $sku_prices[ $sku ] ) ) {
+                if ( ! is_wp_error( $pricelist_items ) && is_array( $pricelist_items ) ) {
+                    $pricelist_diagnostic = sprintf( ' [Pricelist Connected: Found %d price rules]', count( $pricelist_items ) );
+                    
+                    foreach ( $pricelist_items as $item ) {
+                        $price = isset( $item['fixed_price'] ) ? (float) $item['fixed_price'] : 0;
+                        if ( $price <= 0 ) continue;
+
+                        if ( ! empty( $item['product_id'][0] ) && isset( $product_map[ $item['product_id'][0] ] ) ) {
+                            $sku = $product_map[ $item['product_id'][0] ];
                             $sku_prices[ $sku ] = $price;
+                        } elseif ( ! empty( $item['product_tmpl_id'][0] ) && isset( $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ] ) ) {
+                            $sku = $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ];
+                            if ( ! isset( $sku_prices[ $sku ] ) ) {
+                                $sku_prices[ $sku ] = $price;
+                            }
                         }
                     }
+                } else {
+                    $pricelist_diagnostic = ' [Pricelist Connected: But 0 price rules matched the synced products.]';
                 }
             }
         }
@@ -191,10 +212,12 @@ class OWSC_Stock_Sync {
                         $product_changed = true;
                     }
 
-                    // Update Price (If enabled and a valid price was found in Odoo)
+                    // Update Price (Force updating both Regular Price and Active Price)
                     if ( $config['sync_price'] === 'yes' && isset( $sku_prices[ $sku ] ) ) {
-                        if ( (float) $product->get_regular_price() !== (float) $sku_prices[ $sku ] ) {
-                            $product->set_regular_price( $sku_prices[ $sku ] );
+                        $target_price = (string) $sku_prices[ $sku ];
+                        if ( $product->get_regular_price() !== $target_price ) {
+                            $product->set_regular_price( $target_price );
+                            $product->set_price( $target_price ); // Force frontend refresh
                             $updated_price_count++;
                             $product_changed = true;
                         }
@@ -210,7 +233,7 @@ class OWSC_Stock_Sync {
 
         return array(
             'status'  => 'success',
-            'message' => sprintf( 'Sync complete. Updated Stock for %d items. Updated Prices for %d items.', $updated_stock_count, $updated_price_count )
+            'message' => sprintf( 'Sync complete. Updated Stock for %d items. Updated Prices for %d items.%s', $updated_stock_count, $updated_price_count, $pricelist_diagnostic )
         );
     }
 }
