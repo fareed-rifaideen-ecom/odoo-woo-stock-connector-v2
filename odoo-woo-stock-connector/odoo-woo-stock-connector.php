@@ -3,7 +3,7 @@
  * Plugin Name: Odoo WooCommerce Stock Connector V2
  * Plugin URI: https://github.com/fareed-rifaideen-ecom/odoo-woo-stock-connector-v2
  * Description: V2 foundation for a secure Odoo 18 and WooCommerce inventory connector.
- * Version: 2.3.0
+ * Version: 2.6.0
  * Author: Fareed M. Rifaideen
  * Author URI: https://fareed-rifaideen.netlify.app/
  * Requires PHP: 7.4
@@ -14,17 +14,17 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'OWSC_VERSION', '2.3.0' );
+define( 'OWSC_VERSION', '2.6.0' );
 define( 'OWSC_FILE', __FILE__ );
 define( 'OWSC_DIR', plugin_dir_path( __FILE__ ) );
 
-// Load dependencies
 require_once OWSC_DIR . 'includes/class-owsc-odoo-xmlrpc-client.php';
 require_once OWSC_DIR . 'includes/class-owsc-connection-test.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit.php';
 require_once OWSC_DIR . 'includes/class-owsc-sku-audit-admin.php';
 require_once OWSC_DIR . 'includes/class-owsc-stock-sync.php';
 require_once OWSC_DIR . 'includes/class-owsc-order-import.php';
+require_once OWSC_DIR . 'includes/class-owsc-webhook.php';
 
 final class OWSCPluginV2 {
     const OPTION_NAME = 'owsc_odoo_settings';
@@ -34,15 +34,17 @@ final class OWSCPluginV2 {
         add_action( 'admin_post_owsc_save_settings', array( __CLASS__, 'save_settings' ) );
         add_action( 'admin_post_owsc_run_bulk_sync', array( __CLASS__, 'handle_bulk_sync' ) );
         
-        // Register the background cron job hook
         add_action( 'owsc_cron_stock_sync', array( __CLASS__, 'run_scheduled_sync' ) );
         
         OWSC_Connection_Test::instance()->register();
         new OWSC_SKU_Audit_Admin();
 
-        // Register the WooCommerce Order Event capture
         if ( class_exists( 'OWSC_Order_Import' ) ) {
             ( new OWSC_Order_Import() )->register();
+        }
+        
+        if ( class_exists( 'OWSC_Webhook' ) ) {
+            ( new OWSC_Webhook() )->register();
         }
     }
 
@@ -59,7 +61,9 @@ final class OWSCPluginV2 {
             'api_key'       => (string) ( $settings['api_key'] ?? '' ),
             'sync_enabled'  => (string) ( $settings['sync_enabled'] ?? 'no' ),
             'sync_interval' => (string) ( $settings['sync_interval'] ?? 'hourly' ),
-            'auto_confirm'  => (string) ( $settings['auto_confirm'] ?? 'no' ), // NEW: Auto-confirm toggle
+            'auto_confirm'  => (string) ( $settings['auto_confirm'] ?? 'no' ),
+            'sync_price'    => (string) ( $settings['sync_price'] ?? 'no' ),
+            'pricelist_id'  => (int) ( $settings['pricelist_id'] ?? 0 ), // NEW: Uses ID
         );
     }
 
@@ -84,6 +88,9 @@ final class OWSCPluginV2 {
         $sync_message = get_transient( 'owsc_sync_message_' . get_current_user_id() );
         delete_transient( 'owsc_sync_message_' . get_current_user_id() );
 
+        $webhook_token = substr( md5( $config['url'] . $config['username'] ), 0, 16 );
+        $webhook_url   = site_url( '/wp-json/owsc/v1/sync?token=' . $webhook_token );
+
         ?>
         <div class="wrap">
             <h1>Odoo WooCommerce Stock Connector V2</h1>
@@ -101,7 +108,6 @@ final class OWSCPluginV2 {
                 </div>
             <?php endif; ?>
 
-            <p><strong>Phase:</strong> Automated Synchronization & Order Configuration.</p>
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
                 <input type="hidden" name="action" value="owsc_save_settings">
                 <?php wp_nonce_field( 'owsc_save_settings' ); ?>
@@ -122,7 +128,6 @@ final class OWSCPluginV2 {
                         <th scope="row"><label for="odoo_api_key">Odoo API Key</label></th>
                         <td>
                             <input name="api_key" id="odoo_api_key" type="password" class="regular-text" value="" placeholder="<?php echo $config['api_key'] ? 'Saved (hidden)' : 'Enter API key'; ?>">
-                            <p class="description">Leave blank to retain the currently saved API key.</p>
                         </td>
                     </tr>
                     <tr>
@@ -130,7 +135,7 @@ final class OWSCPluginV2 {
                         <td>
                             <label>
                                 <input type="checkbox" name="sync_enabled" id="sync_enabled" value="yes" <?php checked( $config['sync_enabled'], 'yes' ); ?>>
-                                Enable automatic background stock synchronization
+                                Enable automatic background stock synchronization (Cron)
                             </label>
                         </td>
                     </tr>
@@ -149,9 +154,24 @@ final class OWSCPluginV2 {
                         <td>
                             <label>
                                 <input type="checkbox" name="auto_confirm" id="auto_confirm" value="yes" <?php checked( $config['auto_confirm'], 'yes' ); ?>>
-                                <strong>Enable Warehouse Routing & Auto-Confirmation</strong>
+                                Enable Warehouse Routing & Auto-Confirmation
                             </label>
-                            <p class="description">If checked, the plugin will calculate stock and confirm the order in the best warehouse. If unchecked, all imports will be placed in the default warehouse as Draft Quotations.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="sync_price"><strong>Price Synchronization</strong></label></th>
+                        <td>
+                            <label>
+                                <input type="checkbox" name="sync_price" id="sync_price" value="yes" <?php checked( $config['sync_price'], 'yes' ); ?>>
+                                Enable Price Sync from Odoo Pricelist
+                            </label>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="pricelist_id">Target Pricelist ID</label></th>
+                        <td>
+                            <input name="pricelist_id" id="pricelist_id" class="small-text" type="number" value="<?php echo esc_attr( $config['pricelist_id'] ? $config['pricelist_id'] : '' ); ?>">
+                            <p class="description">Enter the numeric ID of the Pricelist. <em>(To find it: Open the Pricelist in Odoo and look at the URL for <code>id=XX</code>)</em></p>
                         </td>
                     </tr>
                 </table>
@@ -159,18 +179,18 @@ final class OWSCPluginV2 {
             </form>
 
             <hr />
-            <h2>Bulk Stock Synchronization</h2>
-            <p>This will immediately query Odoo for all products with <strong>Available for WooCommerce Sync</strong> checked, aggregate their stock across WH, MC, and JM, and update matched SKUs in WooCommerce.</p>
+            <h2>Real-Time Sync (Odoo Webhook)</h2>
+            <p>To update WooCommerce instantly when stock changes in Odoo, create an Automated Action in Odoo Studio targeting the <code>stock.quant</code> model. Use this secure URL:</p>
+            <p><code><?php echo esc_url( $webhook_url ); ?></code></p>
+            
+            <hr />
+            <h2>Bulk Stock & Price Synchronization</h2>
             <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
                 <input type="hidden" name="action" value="owsc_run_bulk_sync">
                 <?php wp_nonce_field( 'owsc_run_bulk_sync' ); ?>
                 <?php submit_button( 'Run Full Manual Sync', 'primary', 'submit', false ); ?>
             </form>
 
-            <hr />
-            <h2>Connection Test</h2>
-            <p>This test only calls Odoo's version and authenticate methods.</p>
-            <?php OWSC_Connection_Test::instance()->render_test_form(); ?>
         </div>
         <?php
     }
@@ -184,27 +204,23 @@ final class OWSCPluginV2 {
         $old_config = self::configuration();
         $submitted_key = isset( $_POST['api_key'] ) ? trim( (string) wp_unslash( $_POST['api_key'] ) ) : '';
         
-        $sync_enabled = isset( $_POST['sync_enabled'] ) ? 'yes' : 'no';
-        $auto_confirm = isset( $_POST['auto_confirm'] ) ? 'yes' : 'no';
-        $allowed_intervals = array( 'hourly', 'twicedaily', 'daily' );
-        $sync_interval = in_array( $_POST['sync_interval'] ?? '', $allowed_intervals, true ) ? sanitize_text_field( wp_unslash( $_POST['sync_interval'] ) ) : 'hourly';
-
         $new_config = array(
-            'url'           => esc_url_raw( trim( (string) wp_unslash( $_POST['url'] ?? '' ) ) ),
-            'database'      => sanitize_text_field( wp_unslash( $_POST['database'] ?? '' ) ),
-            'username'      => sanitize_text_field( wp_unslash( $_POST['username'] ?? '' ) ),
-            'api_key'       => $submitted_key ? $submitted_key : $old_config['api_key'],
-            'sync_enabled'  => $sync_enabled,
-            'sync_interval' => $sync_interval,
-            'auto_confirm'  => $auto_confirm, // NEW
+            'url'            => esc_url_raw( trim( (string) wp_unslash( $_POST['url'] ?? '' ) ) ),
+            'database'       => sanitize_text_field( wp_unslash( $_POST['database'] ?? '' ) ),
+            'username'       => sanitize_text_field( wp_unslash( $_POST['username'] ?? '' ) ),
+            'api_key'        => $submitted_key ? $submitted_key : $old_config['api_key'],
+            'sync_enabled'   => isset( $_POST['sync_enabled'] ) ? 'yes' : 'no',
+            'sync_interval'  => in_array( $_POST['sync_interval'] ?? '', array( 'hourly', 'twicedaily', 'daily' ), true ) ? sanitize_text_field( wp_unslash( $_POST['sync_interval'] ) ) : 'hourly',
+            'auto_confirm'   => isset( $_POST['auto_confirm'] ) ? 'yes' : 'no',
+            'sync_price'     => isset( $_POST['sync_price'] ) ? 'yes' : 'no',
+            'pricelist_id'   => (int) ( $_POST['pricelist_id'] ?? 0 ),
         );
 
         update_option( self::OPTION_NAME, $new_config, false );
 
-        // Handle Cron Scheduling
         wp_clear_scheduled_hook( 'owsc_cron_stock_sync' );
-        if ( $sync_enabled === 'yes' ) {
-            wp_schedule_event( time(), $sync_interval, 'owsc_cron_stock_sync' );
+        if ( $new_config['sync_enabled'] === 'yes' ) {
+            wp_schedule_event( time(), $new_config['sync_interval'], 'owsc_cron_stock_sync' );
         }
 
         wp_safe_redirect( add_query_arg( array( 'page' => 'owsc-connector', 'settings-updated' => 'true' ), admin_url( 'admin.php' ) ) );
