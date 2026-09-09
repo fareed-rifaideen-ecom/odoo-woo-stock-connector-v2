@@ -68,10 +68,22 @@ final class OWSCPluginV2 {
     }
 
     public static function register_menu(): void {
+        // 1. Create the Top-Level Menu
+        add_menu_page( 
+            'Odoo WooCommerce Connector', 
+            'Odoo Sync', 
+            'manage_woocommerce', 
+            'owsc-connector', 
+            array( __CLASS__, 'render_page' ),
+            'dashicons-update', // Standard sync icon
+            56 // Position right below WooCommerce (55)
+        );
+
+        // 2. Register the main page as the first submenu item
         add_submenu_page( 
-            'woocommerce', 
-            'Odoo Connector', 
-            'Odoo Connector', 
+            'owsc-connector', 
+            'Odoo Connector Settings', 
+            'Settings', 
             'manage_woocommerce', 
             'owsc-connector', 
             array( __CLASS__, 'render_page' ) 
