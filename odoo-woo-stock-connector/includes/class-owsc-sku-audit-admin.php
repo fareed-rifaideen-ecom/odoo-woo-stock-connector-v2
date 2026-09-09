@@ -12,7 +12,7 @@ class OWSC_SKU_Audit_Admin {
 
     public function register_menu(): void {
         add_submenu_page( 
-            'woocommerce', 
+            'owsc-connector', // UPDATED: This now points to the new top-level menu slug
             'Odoo SKU Audit', 
             'Odoo SKU Audit', 
             'manage_woocommerce', 
