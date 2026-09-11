@@ -58,7 +58,7 @@ class OWSC_Stock_Sync {
 
         $location_ids = array_column( (array) $locations, 'id' );
 
-        // 3. Fetch Stock Quants
+        // 3. Fetch Stock Quants (This inherently includes native Odoo reserved_quantity for confirmed orders)
         $quants = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
             'stock.quant', 'search_read',
@@ -79,13 +79,14 @@ class OWSC_Stock_Sync {
                 $pid = $quant['product_id'][0] ?? 0;
                 if ( isset( $product_map[ $pid ] ) ) {
                     $sku = $product_map[ $pid ];
+                    // Native Odoo deduction of confirmed sales occurs here:
                     $available = (float) ( $quant['quantity'] ?? 0 ) - (float) ( $quant['reserved_quantity'] ?? 0 );
                     $stock_totals[ $sku ] += $available;
                 }
             }
         }
 
-        // 3.5 Dynamic Subtraction for Unconfirmed Drafts
+        // 3.5 Dynamic Subtraction for Unconfirmed Drafts ONLY
         $tag_ids = array();
         $tags = $client->execute_kw( 
             $config['database'], $uid, $config['api_key'], 
@@ -103,7 +104,7 @@ class OWSC_Stock_Sync {
                 $config['database'], $uid, $config['api_key'],
                 'sale.order', 'search_read',
                 array( array(
-                    array( 'state', 'in', array( 'draft', 'sent' ) ),
+                    array( 'state', 'in', array( 'draft', 'sent' ) ), // STRICT RULE: Only subtract pending quotations
                     array( 'tag_ids', 'in', $tag_ids ),
                     array( 'client_order_ref', 'ilike', 'WOO-' ) 
                 ) ),
@@ -135,14 +136,12 @@ class OWSC_Stock_Sync {
             }
         }
 
-        // --- NEW: 3.8 Fetch Prices using Explicit Pricelist ID ---
+        // 3.8 Fetch Prices using Explicit Pricelist ID 
         $sku_prices = array();
         $pricelist_diagnostic = '';
-        
         $pricelist_id = isset( $config['pricelist_id'] ) ? (int) $config['pricelist_id'] : 0;
         
         if ( $config['sync_price'] === 'yes' && $pricelist_id > 0 ) {
-            
             $pricelist_items = $client->execute_kw(
                 $config['database'], $uid, $config['api_key'],
                 'product.pricelist.item', 'search_read',
@@ -177,7 +176,7 @@ class OWSC_Stock_Sync {
             }
         }
 
-        // 4. Update WooCommerce
+        // 4. Update WooCommerce (Delta efficiency applied here)
         $updated_stock_count = 0;
         $updated_price_count = 0;
 
@@ -191,7 +190,7 @@ class OWSC_Stock_Sync {
                 if ( $product ) {
                     $product_changed = false;
 
-                    // Update Stock
+                    // Only pushes data to WooCommerce if the stock actually drifted
                     if ( $product->get_manage_stock() && (float) $product->get_stock_quantity() !== (float) $final_qty ) {
                         $product->set_stock_quantity( $final_qty );
                         $product->set_stock_status( $status );
@@ -199,7 +198,7 @@ class OWSC_Stock_Sync {
                         $product_changed = true;
                     }
 
-                    // Update Price (Force updating both Regular Price and Active Price)
+                    // Only pushes data to WooCommerce if the price actually changed
                     if ( $config['sync_price'] === 'yes' && isset( $sku_prices[ $sku ] ) ) {
                         $target_price = (string) $sku_prices[ $sku ];
                         if ( $product->get_regular_price() !== $target_price ) {
@@ -217,6 +216,9 @@ class OWSC_Stock_Sync {
                 }
             }
         }
+
+        // Update the last sync timestamp in WordPress for diagnostic tracking
+        update_option( 'owsc_last_sync_time', gmdate('Y-m-d H:i:s') );
 
         return array(
             'status'  => 'success',
