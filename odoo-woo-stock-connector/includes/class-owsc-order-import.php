@@ -19,16 +19,26 @@ class OWSC_Order_Import {
         $order->update_meta_data( '_owsc_odoo_import_status', 'processing' );
         $order->save_meta_data();
 
-        // 2. Extract Customer Data (UPDATED: Added Billing Fallbacks & Street 2)
+        // --- NEW: Extract State Name & Code from WooCommerce ---
+        $country_code = $order->get_shipping_country() ?: $order->get_billing_country();
+        $state_code   = $order->get_shipping_state() ?: $order->get_billing_state();
+        
+        $states_list = WC()->countries->get_states( $country_code );
+        $state_name  = isset( $states_list[ $state_code ] ) ? $states_list[ $state_code ] : $state_code;
+
+        // 2. Extract Customer Data (UPDATED: Added State parameters & Name fallback)
         $customer_data = array(
-            'email'   => $order->get_billing_email(),
-            'phone'   => $order->get_billing_phone(),
-            'name'    => trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
-            'street'  => $order->get_shipping_address_1() ?: $order->get_billing_address_1(),
-            'street2' => $order->get_shipping_address_2() ?: $order->get_billing_address_2(),
-            'city'    => $order->get_shipping_city() ?: $order->get_billing_city(),
-            'zip'     => $order->get_shipping_postcode() ?: $order->get_billing_postcode(),
-            'country' => $order->get_shipping_country() ?: $order->get_billing_country(), 
+            'email'      => $order->get_billing_email(),
+            'phone'      => $order->get_billing_phone(),
+            // Prefer shipping name, fallback to billing name
+            'name'       => trim( $order->get_shipping_first_name() . ' ' . $order->get_shipping_last_name() ) ?: trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
+            'street'     => $order->get_shipping_address_1() ?: $order->get_billing_address_1(),
+            'street2'    => $order->get_shipping_address_2() ?: $order->get_billing_address_2(),
+            'city'       => $order->get_shipping_city() ?: $order->get_billing_city(),
+            'zip'        => $order->get_shipping_postcode() ?: $order->get_billing_postcode(),
+            'country'    => $country_code,
+            'state_code' => $state_code,
+            'state_name' => $state_name,
         );
 
         // 3. Extract Line Items & SKUs
@@ -361,8 +371,28 @@ class OWSC_Order_Import {
             }
         }
 
-        // 4. Build Address Payload
+        // --- NEW: 3.5 Map State ID (Searching Odoo's res.country.state database) ---
+        $state_id = null;
+        if ( $country_id && ( ! empty( $customer_data['state_code'] ) || ! empty( $customer_data['state_name'] ) ) ) {
+            $states = $client->execute_kw(
+                $config['database'], $uid, $config['api_key'],
+                'res.country.state', 'search_read',
+                array( array(
+                    array( 'country_id', '=', $country_id ),
+                    '|',
+                    array( 'code', '=', $customer_data['state_code'] ),
+                    array( 'name', 'ilike', $customer_data['state_name'] ) // Matches "Dubai", "Abu Dhabi", etc.
+                ) ),
+                array( 'fields' => array( 'id' ), 'limit' => 1 )
+            );
+            if ( ! is_wp_error( $states ) && ! empty( $states ) ) {
+                $state_id = (int) $states[0]['id'];
+            }
+        }
+
+        // 4. Build Address Payload (UPDATED: Added 'name' and 'state_id')
         $address_payload = array(
+            'name'    => $customer_data['name'] ?: 'WooCommerce Guest',
             'street'  => $customer_data['street'],
             'street2' => $customer_data['street2'],
             'city'    => $customer_data['city'],
@@ -374,10 +404,13 @@ class OWSC_Order_Import {
         if ( $country_id ) {
             $address_payload['country_id'] = $country_id;
         }
+        if ( $state_id ) {
+            $address_payload['state_id'] = $state_id; // Connects the relational State field
+        }
 
         // 5. Update Existing OR Create New Contact
         if ( $partner_id > 0 ) {
-            // This forces Odoo to overwrite the existing customer's blank address with the WooCommerce address
+            // UPDATED: Because 'name' is in the payload, this will update BOTH Address AND Name
             $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
                 'res.partner', 'write', 
@@ -386,8 +419,6 @@ class OWSC_Order_Import {
             return $partner_id;
             
         } else {
-            // Create a brand new customer
-            $address_payload['name']  = ! empty( $customer_data['name'] ) ? $customer_data['name'] : 'WooCommerce Guest';
             $address_payload['email'] = $customer_data['email'];
 
             $tags = $client->execute_kw( 
