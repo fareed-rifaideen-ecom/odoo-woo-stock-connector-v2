@@ -30,6 +30,8 @@ final class OWSCPluginV2 {
     const OPTION_NAME = 'owsc_odoo_settings';
 
     public static function boot(): void {
+        add_filter( 'cron_schedules', array( __CLASS__, 'add_custom_cron_schedule' ) ); // NEW: Custom Cron Hook
+        
         add_action( 'admin_menu', array( __CLASS__, 'register_menu' ) );
         add_action( 'admin_post_owsc_save_settings', array( __CLASS__, 'save_settings' ) );
         add_action( 'admin_post_owsc_run_bulk_sync', array( __CLASS__, 'handle_bulk_sync' ) );
@@ -52,6 +54,18 @@ final class OWSCPluginV2 {
         wp_clear_scheduled_hook( 'owsc_cron_stock_sync' );
     }
 
+    // NEW METHOD: Registers the custom minute-based interval with WordPress
+    public static function add_custom_cron_schedule( $schedules ) {
+        $settings = get_option( self::OPTION_NAME, array() );
+        $minutes  = max( 1, (int) ( $settings['cron_interval'] ?? 5 ) );
+        
+        $schedules['owsc_custom_interval'] = array(
+            'interval' => $minutes * 60, // Converts minutes to seconds
+            'display'  => sprintf( 'Every %d Minutes (Odoo Sync)', $minutes )
+        );
+        return $schedules;
+    }
+
     public static function configuration(): array {
         $settings = get_option( self::OPTION_NAME, array() );
         return array(
@@ -60,10 +74,13 @@ final class OWSCPluginV2 {
             'username'      => (string) ( $settings['username'] ?? '' ),
             'api_key'       => (string) ( $settings['api_key'] ?? '' ),
             'sync_enabled'  => (string) ( $settings['sync_enabled'] ?? 'no' ),
-            'sync_interval' => (string) ( $settings['sync_interval'] ?? 'hourly' ),
+            'cron_interval' => (int) ( $settings['cron_interval'] ?? 5 ), // NEW
+            'priority_jm'   => (string) ( $settings['priority_jm'] ?? 'JM,MC,WH' ), // NEW
+            'priority_mc'   => (string) ( $settings['priority_mc'] ?? 'MC,WH,JM' ), // NEW
+            'priority_uae'  => (string) ( $settings['priority_uae'] ?? 'WH,MC,JM' ), // NEW
             'auto_confirm'  => (string) ( $settings['auto_confirm'] ?? 'no' ),
             'sync_price'    => (string) ( $settings['sync_price'] ?? 'no' ),
-            'pricelist_id'  => (int) ( $settings['pricelist_id'] ?? 0 ), // NEW: Uses ID
+            'pricelist_id'  => (int) ( $settings['pricelist_id'] ?? 0 ),
         );
     }
 
@@ -75,8 +92,8 @@ final class OWSCPluginV2 {
             'manage_woocommerce', 
             'owsc-connector', 
             array( __CLASS__, 'render_page' ),
-            'dashicons-update', // Standard sync icon
-            56 // Position right below WooCommerce (55)
+            'dashicons-update',
+            56 
         );
 
         // 2. Register the main page as the first submenu item
@@ -151,16 +168,27 @@ final class OWSCPluginV2 {
                             </label>
                         </td>
                     </tr>
+                    <!-- NEW UI FIELDS: Cron Interval & Priority Routings -->
                     <tr>
-                        <th scope="row"><label for="sync_interval">Stock Sync Interval</label></th>
+                        <th scope="row"><label for="cron_interval">Cron Interval (Minutes)</label></th>
                         <td>
-                            <select name="sync_interval" id="sync_interval">
-                                <option value="hourly" <?php selected( $config['sync_interval'], 'hourly' ); ?>>Hourly</option>
-                                <option value="twicedaily" <?php selected( $config['sync_interval'], 'twicedaily' ); ?>>Twice Daily (Every 12 hours)</option>
-                                <option value="daily" <?php selected( $config['sync_interval'], 'daily' ); ?>>Daily</option>
-                            </select>
+                            <input name="cron_interval" id="cron_interval" class="small-text" type="number" min="1" value="<?php echo esc_attr( $config['cron_interval'] ); ?>">
+                            <p class="description">How often the background sync should run. (Requires a server-level cron job triggering WP-Cron).</p>
                         </td>
                     </tr>
+                    <tr>
+                        <th scope="row"><label>Routing Priority: Jumeirah Pickup</label></th>
+                        <td><input name="priority_jm" class="regular-text" type="text" value="<?php echo esc_attr( $config['priority_jm'] ); ?>"></td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label>Routing Priority: Motor City Pickup</label></th>
+                        <td><input name="priority_mc" class="regular-text" type="text" value="<?php echo esc_attr( $config['priority_mc'] ); ?>"></td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label>Routing Priority: UAE Delivery</label></th>
+                        <td><input name="priority_uae" class="regular-text" type="text" value="<?php echo esc_attr( $config['priority_uae'] ); ?>"></td>
+                    </tr>
+                    <!-- END NEW UI FIELDS -->
                     <tr>
                         <th scope="row"><label for="auto_confirm">Order Import Rules</label></th>
                         <td>
@@ -222,7 +250,10 @@ final class OWSCPluginV2 {
             'username'       => sanitize_text_field( wp_unslash( $_POST['username'] ?? '' ) ),
             'api_key'        => $submitted_key ? $submitted_key : $old_config['api_key'],
             'sync_enabled'   => isset( $_POST['sync_enabled'] ) ? 'yes' : 'no',
-            'sync_interval'  => in_array( $_POST['sync_interval'] ?? '', array( 'hourly', 'twicedaily', 'daily' ), true ) ? sanitize_text_field( wp_unslash( $_POST['sync_interval'] ) ) : 'hourly',
+            'cron_interval'  => max( 1, (int) ( $_POST['cron_interval'] ?? 5 ) ), // NEW
+            'priority_jm'    => sanitize_text_field( wp_unslash( $_POST['priority_jm'] ?? 'JM,MC,WH' ) ), // NEW
+            'priority_mc'    => sanitize_text_field( wp_unslash( $_POST['priority_mc'] ?? 'MC,WH,JM' ) ), // NEW
+            'priority_uae'   => sanitize_text_field( wp_unslash( $_POST['priority_uae'] ?? 'WH,MC,JM' ) ), // NEW
             'auto_confirm'   => isset( $_POST['auto_confirm'] ) ? 'yes' : 'no',
             'sync_price'     => isset( $_POST['sync_price'] ) ? 'yes' : 'no',
             'pricelist_id'   => (int) ( $_POST['pricelist_id'] ?? 0 ),
@@ -232,7 +263,8 @@ final class OWSCPluginV2 {
 
         wp_clear_scheduled_hook( 'owsc_cron_stock_sync' );
         if ( $new_config['sync_enabled'] === 'yes' ) {
-            wp_schedule_event( time(), $new_config['sync_interval'], 'owsc_cron_stock_sync' );
+            // UPDATED: Triggers using our new custom interval instead of the default WP intervals
+            wp_schedule_event( time(), 'owsc_custom_interval', 'owsc_cron_stock_sync' );
         }
 
         wp_safe_redirect( add_query_arg( array( 'page' => 'owsc-connector', 'settings-updated' => 'true' ), admin_url( 'admin.php' ) ) );
