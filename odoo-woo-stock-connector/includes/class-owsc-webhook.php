@@ -28,23 +28,30 @@ class OWSC_Webhook {
     }
 
     public function handle_webhook( \WP_REST_Request $request ): \WP_REST_Response {
-        // Prevent concurrent overlapping runs if Odoo sends multiple rapid webhooks
-        if ( get_transient( 'owsc_webhook_lock' ) ) {
+        // Parse the incoming JSON payload from Odoo
+        $params = $request->get_json_params();
+        $target_sku = isset( $params['sku'] ) ? sanitize_text_field( $params['sku'] ) : '';
+
+        // Dynamic Locking: Use a specific lock if a SKU is provided, otherwise use the global lock
+        $lock_name = $target_sku ? 'owsc_webhook_lock_' . md5( $target_sku ) : 'owsc_webhook_lock';
+
+        // Prevent concurrent overlapping runs for the exact same product/sync
+        if ( get_transient( $lock_name ) ) {
             return new \WP_REST_Response( array( 
                 'status'  => 'skipped', 
-                'message' => 'Sync already in progress. Batching request.' 
+                'message' => sprintf( 'Sync already in progress for %s. Batching request.', $target_sku ?: 'full catalog' ) 
             ), 200 );
         }
         
         // Lock for 30 seconds
-        set_transient( 'owsc_webhook_lock', true, 30 ); 
+        set_transient( $lock_name, true, 30 ); 
         
-        // Execute the identical Bulk Sync engine you just tested
+        // Execute the Sync engine, passing the specific SKU (if one exists)
         $sync = new OWSC_Stock_Sync();
-        $result = $sync->run_sync();
+        $result = $sync->run_sync( $target_sku );
         
         // Release the lock
-        delete_transient( 'owsc_webhook_lock' );
+        delete_transient( $lock_name );
         
         return new \WP_REST_Response( $result, 200 );
     }
