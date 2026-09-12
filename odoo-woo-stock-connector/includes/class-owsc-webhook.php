@@ -7,8 +7,6 @@ class OWSC_Webhook {
     
     public function register(): void {
         add_action( 'rest_api_init', array( $this, 'register_routes' ) );
-        // Register the background worker hook
-        add_action( 'owsc_execute_background_sync', array( $this, 'background_sync_worker' ), 10, 2 );
     }
 
     public function register_routes(): void {
@@ -28,10 +26,17 @@ class OWSC_Webhook {
     }
 
     public function handle_webhook( \WP_REST_Request $request ): \WP_REST_Response {
+        // 1. Prevent Odoo connection drops from killing the process
+        ignore_user_abort( true );
+        
+        // 2. Extend PHP timeout for large catalog syncs
+        if ( function_exists( 'set_time_limit' ) ) {
+            set_time_limit( 120 );
+        }
+        
         $params = $request->get_json_params() ?: array();
         $record = isset( $params[0] ) && is_array( $params[0] ) ? $params[0] : $params;
         
-        // 1. Check for standard Inventory Webhook (Product Variant ID)
         $odoo_product_id = 0;
         if ( isset( $record['product_id'] ) ) {
             if ( is_array( $record['product_id'] ) && ! empty( $record['product_id'][0] ) ) {
@@ -41,48 +46,50 @@ class OWSC_Webhook {
             }
         }
 
-        // 2. Check for Force OOS Webhook (Product Template SKU)
         $target_sku = '';
         if ( isset( $record['default_code'] ) && is_string( $record['default_code'] ) ) {
             $target_sku = sanitize_text_field( $record['default_code'] );
         }
 
-        // 3. Routing Logic (Full vs Micro)
-        if ( $odoo_product_id === 0 && empty( $target_sku ) ) {
-            // FULL SYNC FALLBACK
-            if ( get_transient( 'owsc_webhook_lock_global' ) ) {
-                return new \WP_REST_Response( array( 'status' => 'skipped', 'message' => 'Full sync in progress.' ), 200 );
-            }
-            set_transient( 'owsc_webhook_lock_global', true, 45 ); 
-            
-            // CRITICAL FIX: Offload to background cron to prevent Odoo's timeout from killing the process
-            wp_schedule_single_event( time(), 'owsc_execute_background_sync', array( '', 0 ) );
-            
-            // Return instantly so Odoo is happy
-            return new \WP_REST_Response( array( 'status' => 'success', 'message' => 'Full sync triggered in background.' ), 200 );
-        } else {
-            // MICRO-SYNC: Fast enough to run synchronously
-            $sync = new OWSC_Stock_Sync();
-            $result = $sync->run_sync( $target_sku, $odoo_product_id ); 
-            
-            $status = isset( $result['status'] ) ? $result['status'] : 'info';
-            if ( function_exists( 'owsc_log_sync_event' ) ) {
-                owsc_log_sync_event( 'Webhook (Micro)', $result['message'], $status );
-            }
-            return new \WP_REST_Response( $result, 200 );
-        }
-    }
+        $is_full_sync = ( $odoo_product_id === 0 && empty( $target_sku ) );
+        $source = $is_full_sync ? 'Webhook (Full)' : 'Webhook (Micro)';
 
-    // The background worker that runs completely detached from Odoo's 3-second limit
-    public function background_sync_worker( $target_sku, $odoo_product_id ) {
+        // ==========================================
+        // DIAGNOSTIC LOG: Write immediately before processing
+        // ==========================================
+        if ( function_exists( 'owsc_log_sync_event' ) ) {
+            owsc_log_sync_event( $source, 'Request received from Odoo. Processing started...', 'info' );
+        }
+
+        if ( $is_full_sync ) {
+            if ( get_transient( 'owsc_webhook_lock_global' ) ) {
+                $msg = 'Full sync already in progress. Skipped.';
+                if ( function_exists( 'owsc_log_sync_event' ) ) {
+                    owsc_log_sync_event( $source, $msg, 'skipped' );
+                }
+                return new \WP_REST_Response( array( 'status' => 'skipped', 'message' => $msg ), 200 );
+            }
+            set_transient( 'owsc_webhook_lock_global', true, 60 ); 
+        } else {
+            usleep( 1500000 ); 
+        }
+        
         $sync = new OWSC_Stock_Sync();
         $result = $sync->run_sync( $target_sku, $odoo_product_id ); 
         
-        delete_transient( 'owsc_webhook_lock_global' );
+        if ( $is_full_sync ) {
+            delete_transient( 'owsc_webhook_lock_global' );
+        }
         
         $status = isset( $result['status'] ) ? $result['status'] : 'info';
+        
+        // ==========================================
+        // FINAL LOG: Write success/error message
+        // ==========================================
         if ( function_exists( 'owsc_log_sync_event' ) ) {
-            owsc_log_sync_event( 'Webhook (Full)', $result['message'], $status );
+            owsc_log_sync_event( $source, $result['message'], $status );
         }
+        
+        return new \WP_REST_Response( $result, 200 );
     }
 }
