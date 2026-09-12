@@ -54,7 +54,12 @@ class OWSC_Webhook {
         if ( $odoo_product_id === 0 && empty( $target_sku ) ) {
             // FULL SYNC FALLBACK: Retain the global lock to prevent server crashes
             if ( get_transient( 'owsc_webhook_lock_global' ) ) {
-                return new \WP_REST_Response( array( 'status' => 'skipped', 'message' => 'Full sync in progress.' ), 200 );
+                $msg = 'Full sync in progress.';
+                // LOG THE SKIPPED ATTEMPT
+                if ( function_exists( 'owsc_log_sync_event' ) ) {
+                    owsc_log_sync_event( 'Webhook (Full)', $msg, 'skipped' );
+                }
+                return new \WP_REST_Response( array( 'status' => 'skipped', 'message' => $msg ), 200 );
             }
             set_transient( 'owsc_webhook_lock_global', true, 45 ); 
         } else {
@@ -68,6 +73,14 @@ class OWSC_Webhook {
         
         if ( $odoo_product_id === 0 && empty( $target_sku ) ) {
             delete_transient( 'owsc_webhook_lock_global' );
+        }
+        
+        // 4. LOG THE EXECUTION RESULT
+        $source = ( $odoo_product_id === 0 && empty( $target_sku ) ) ? 'Webhook (Full)' : 'Webhook (Micro)';
+        $status = isset( $result['status'] ) ? $result['status'] : 'info';
+        
+        if ( function_exists( 'owsc_log_sync_event' ) ) {
+            owsc_log_sync_event( $source, $result['message'], $status );
         }
         
         return new \WP_REST_Response( $result, 200 );
