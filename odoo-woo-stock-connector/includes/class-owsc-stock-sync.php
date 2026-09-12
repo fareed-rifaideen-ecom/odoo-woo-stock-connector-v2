@@ -4,7 +4,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 class OWSC_Stock_Sync {
-    public function run_sync(): array {
+    public function run_sync( string $target_sku = '' ): array {
         $config = OWSCPluginV2::configuration();
         if ( ! $config['url'] || ! $config['database'] || ! $config['username'] || ! $config['api_key'] ) {
             return array( 'status' => 'error', 'message' => 'Odoo configuration incomplete. Cannot run sync.' );
@@ -17,23 +17,34 @@ class OWSC_Stock_Sync {
             return array( 'status' => 'error', 'message' => 'Odoo authentication failed. Cannot run sync.' );
         }
 
-        // 1. Fetch eligible Odoo products (UPDATED: Added list_price for fallback)
+        // --- UPDATED: Dynamic Domain Construction ---
+        $domain = array( 
+            array( 'x_studio_available_for_woocommerce_sync', '=', true ) 
+        );
+        
+        // If a specific SKU is provided via webhook, restrict the search to ONLY that item
+        if ( ! empty( $target_sku ) ) {
+            $domain[] = array( 'default_code', '=', $target_sku );
+        }
+
+        // 1. Fetch eligible Odoo products (Micro-sync or Full Catalog)
         $products = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
             'product.product', 'search_read',
-            array( array( array( 'x_studio_available_for_woocommerce_sync', '=', true ) ) ),
+            array( $domain ),
             array( 'fields' => array( 'id', 'default_code', 'product_tmpl_id', 'list_price' ) )
         );
 
         if ( is_wp_error( $products ) || ! is_array( $products ) || empty( $products ) ) {
-            return array( 'status' => 'info', 'message' => 'No eligible products found for sync in Odoo.' );
+            $msg = $target_sku ? sprintf( 'SKU %s not found or not enabled for sync in Odoo.', $target_sku ) : 'No eligible products found for sync in Odoo.';
+            return array( 'status' => 'info', 'message' => $msg );
         }
 
         $product_map      = array(); 
         $odoo_product_ids = array();
         $odoo_tmpl_ids    = array();
         $tmpl_to_sku_map  = array();
-        $sku_prices       = array(); // Stores prices per SKU
+        $sku_prices       = array(); 
         
         foreach ( $products as $p ) {
             if ( ! empty( $p['default_code'] ) ) {
@@ -46,7 +57,6 @@ class OWSC_Stock_Sync {
                     $tmpl_to_sku_map[ $p['product_tmpl_id'][0] ] = $sku;
                 }
 
-                // FALLBACK: Store the default Odoo Sales Price
                 if ( isset( $p['list_price'] ) ) {
                     $sku_prices[ $sku ] = (float) $p['list_price'];
                 }
@@ -141,7 +151,7 @@ class OWSC_Stock_Sync {
             }
         }
 
-        // 3.8 Fetch Prices using Explicit Pricelist ID (If Provided)
+        // 3.8 Fetch Prices using Explicit Pricelist ID
         $pricelist_diagnostic = ' [Standard Price Sync Active]';
         $pricelist_id = isset( $config['pricelist_id'] ) ? (int) $config['pricelist_id'] : 0;
         
@@ -167,10 +177,10 @@ class OWSC_Stock_Sync {
 
                     if ( ! empty( $item['product_id'][0] ) && isset( $product_map[ $item['product_id'][0] ] ) ) {
                         $sku = $product_map[ $item['product_id'][0] ];
-                        $sku_prices[ $sku ] = $price; // Overwrites Standard Price
+                        $sku_prices[ $sku ] = $price; 
                     } elseif ( ! empty( $item['product_tmpl_id'][0] ) && isset( $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ] ) ) {
                         $sku = $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ];
-                        $sku_prices[ $sku ] = $price; // Overwrites Standard Price
+                        $sku_prices[ $sku ] = $price; 
                     }
                 }
             } else {
@@ -178,7 +188,7 @@ class OWSC_Stock_Sync {
             }
         }
 
-        // 4. Update WooCommerce (Delta Efficiency Applied)
+        // 4. Update WooCommerce
         $updated_stock_count = 0;
         $updated_price_count = 0;
 
@@ -199,7 +209,6 @@ class OWSC_Stock_Sync {
                         $product_changed = true;
                     }
 
-                    // INCREMENTAL SYNC: Only pushes data if the float price actually changed
                     if ( $config['sync_price'] === 'yes' && isset( $sku_prices[ $sku ] ) ) {
                         $target_price  = (float) $sku_prices[ $sku ];
                         $current_price = (float) $product->get_regular_price();
@@ -219,7 +228,10 @@ class OWSC_Stock_Sync {
             }
         }
 
-        update_option( 'owsc_last_sync_time', gmdate('Y-m-d H:i:s') );
+        // Only update the 'Last Sync' timestamp if this was a full catalog run
+        if ( empty( $target_sku ) ) {
+            update_option( 'owsc_last_sync_time', gmdate('Y-m-d H:i:s') );
+        }
 
         return array(
             'status'  => 'success',
