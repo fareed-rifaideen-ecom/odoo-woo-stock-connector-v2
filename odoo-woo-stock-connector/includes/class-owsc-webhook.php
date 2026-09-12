@@ -28,29 +28,30 @@ class OWSC_Webhook {
     public function handle_webhook( \WP_REST_Request $request ): \WP_REST_Response {
         $params = $request->get_json_params() ?: array();
         
-        // Extract Product ID from Odoo's native webhook payload 
         $odoo_product_id = 0;
         if ( isset( $params['product_id'] ) && is_array( $params['product_id'] ) && ! empty( $params['product_id'][0] ) ) {
             $odoo_product_id = (int) $params['product_id'][0];
         }
 
-        // Dynamic Locking based on Odoo Product ID
-        $lock_name = $odoo_product_id > 0 ? 'owsc_webhook_lock_pid_' . $odoo_product_id : 'owsc_webhook_lock';
-
-        if ( get_transient( $lock_name ) ) {
-            return new \WP_REST_Response( array( 
-                'status'  => 'skipped', 
-                'message' => sprintf( 'Sync already in progress for %s. Batching request.', $odoo_product_id > 0 ? 'Product ID ' . $odoo_product_id : 'full catalog' ) 
-            ), 200 );
+        if ( $odoo_product_id === 0 ) {
+            // FULL SYNC: Retain the global lock to prevent server crashes
+            if ( get_transient( 'owsc_webhook_lock_global' ) ) {
+                return new \WP_REST_Response( array( 'status' => 'skipped', 'message' => 'Full sync in progress.' ), 200 );
+            }
+            set_transient( 'owsc_webhook_lock_global', true, 45 ); 
+        } else {
+            // MICRO-SYNC: Force WordPress to take a breath for 1.5 seconds.
+            // Odoo fires rapid webhooks during transfers (one for creation, one for quantity update).
+            // This delay ensures Odoo has fully committed the final stock number before WP reads it.
+            usleep( 1500000 ); 
         }
         
-        set_transient( $lock_name, true, 30 ); 
-        
         $sync = new OWSC_Stock_Sync();
-        // Pass the exact Odoo Product ID to the sync engine
         $result = $sync->run_sync( '', $odoo_product_id ); 
         
-        delete_transient( $lock_name );
+        if ( $odoo_product_id === 0 ) {
+            delete_transient( 'owsc_webhook_lock_global' );
+        }
         
         return new \WP_REST_Response( $result, 200 );
     }
