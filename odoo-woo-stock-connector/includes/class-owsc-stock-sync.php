@@ -4,7 +4,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 class OWSC_Stock_Sync {
-    public function run_sync( string $target_sku = '' ): array {
+    // Natively accepts the Odoo Product ID
+    public function run_sync( string $target_sku = '', int $target_odoo_product_id = 0 ): array {
         $config = OWSCPluginV2::configuration();
         if ( ! $config['url'] || ! $config['database'] || ! $config['username'] || ! $config['api_key'] ) {
             return array( 'status' => 'error', 'message' => 'Odoo configuration incomplete. Cannot run sync.' );
@@ -17,17 +18,18 @@ class OWSC_Stock_Sync {
             return array( 'status' => 'error', 'message' => 'Odoo authentication failed. Cannot run sync.' );
         }
 
-        // --- UPDATED: Dynamic Domain Construction ---
         $domain = array( 
             array( 'x_studio_available_for_woocommerce_sync', '=', true ) 
         );
         
-        // If a specific SKU is provided via webhook, restrict the search to ONLY that item
+        // Dynamically target either SKU or Odoo Product ID
         if ( ! empty( $target_sku ) ) {
             $domain[] = array( 'default_code', '=', $target_sku );
+        } elseif ( $target_odoo_product_id > 0 ) {
+            $domain[] = array( 'id', '=', $target_odoo_product_id );
         }
 
-        // 1. Fetch eligible Odoo products (Micro-sync or Full Catalog)
+        // 1. Fetch eligible Odoo products
         $products = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
             'product.product', 'search_read',
@@ -36,7 +38,7 @@ class OWSC_Stock_Sync {
         );
 
         if ( is_wp_error( $products ) || ! is_array( $products ) || empty( $products ) ) {
-            $msg = $target_sku ? sprintf( 'SKU %s not found or not enabled for sync in Odoo.', $target_sku ) : 'No eligible products found for sync in Odoo.';
+            $msg = ( $target_sku || $target_odoo_product_id ) ? 'Target product not found or not enabled for sync in Odoo.' : 'No eligible products found for sync in Odoo.';
             return array( 'status' => 'info', 'message' => $msg );
         }
 
@@ -229,7 +231,7 @@ class OWSC_Stock_Sync {
         }
 
         // Only update the 'Last Sync' timestamp if this was a full catalog run
-        if ( empty( $target_sku ) ) {
+        if ( empty( $target_sku ) && empty( $target_odoo_product_id ) ) {
             update_option( 'owsc_last_sync_time', gmdate('Y-m-d H:i:s') );
         }
 
