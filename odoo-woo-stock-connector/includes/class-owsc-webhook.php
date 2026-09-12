@@ -26,7 +26,7 @@ class OWSC_Webhook {
     }
 
     public function handle_webhook( \WP_REST_Request $request ): \WP_REST_Response {
-        // CRITICAL FIX: Prevent Odoo's 3-second timeout from killing the WordPress process
+        // CRITICAL FIX: Prevent Odoo's timeout from killing the WordPress process
         ignore_user_abort( true );
         
         $params = $request->get_json_params() ?: array();
@@ -34,6 +34,7 @@ class OWSC_Webhook {
         // Odoo 18 webhooks often send payloads wrapped in a list: [ { "product_id": ... } ]
         $record = isset( $params[0] ) && is_array( $params[0] ) ? $params[0] : $params;
         
+        // 1. Check for standard Inventory Webhook (Product Variant ID)
         $odoo_product_id = 0;
         if ( isset( $record['product_id'] ) ) {
             if ( is_array( $record['product_id'] ) && ! empty( $record['product_id'][0] ) ) {
@@ -43,7 +44,14 @@ class OWSC_Webhook {
             }
         }
 
-        if ( $odoo_product_id === 0 ) {
+        // 2. Check for Force OOS Webhook (Product Template SKU)
+        $target_sku = '';
+        if ( isset( $record['default_code'] ) && is_string( $record['default_code'] ) ) {
+            $target_sku = sanitize_text_field( $record['default_code'] );
+        }
+
+        // 3. Routing Logic (Full vs Micro)
+        if ( $odoo_product_id === 0 && empty( $target_sku ) ) {
             // FULL SYNC FALLBACK: Retain the global lock to prevent server crashes
             if ( get_transient( 'owsc_webhook_lock_global' ) ) {
                 return new \WP_REST_Response( array( 'status' => 'skipped', 'message' => 'Full sync in progress.' ), 200 );
@@ -55,9 +63,10 @@ class OWSC_Webhook {
         }
         
         $sync = new OWSC_Stock_Sync();
-        $result = $sync->run_sync( '', $odoo_product_id ); 
+        // Pass both variables; the sync engine will prioritize dynamically
+        $result = $sync->run_sync( $target_sku, $odoo_product_id ); 
         
-        if ( $odoo_product_id === 0 ) {
+        if ( $odoo_product_id === 0 && empty( $target_sku ) ) {
             delete_transient( 'owsc_webhook_lock_global' );
         }
         

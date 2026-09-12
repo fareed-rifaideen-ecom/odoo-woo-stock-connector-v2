@@ -4,7 +4,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 class OWSC_Stock_Sync {
-    // Natively accepts the Odoo Product ID
+    
     public function run_sync( string $target_sku = '', int $target_odoo_product_id = 0 ): array {
         $config = OWSCPluginV2::configuration();
         if ( ! $config['url'] || ! $config['database'] || ! $config['username'] || ! $config['api_key'] ) {
@@ -22,19 +22,18 @@ class OWSC_Stock_Sync {
             array( 'x_studio_available_for_woocommerce_sync', '=', true ) 
         );
         
-        // Dynamically target either SKU or Odoo Product ID
         if ( ! empty( $target_sku ) ) {
             $domain[] = array( 'default_code', '=', $target_sku );
         } elseif ( $target_odoo_product_id > 0 ) {
             $domain[] = array( 'id', '=', $target_odoo_product_id );
         }
 
-        // 1. Fetch eligible Odoo products
+        // 1. Fetch eligible Odoo products (ADDED: x_studio_force_out_of_stock)
         $products = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
             'product.product', 'search_read',
             array( $domain ),
-            array( 'fields' => array( 'id', 'default_code', 'product_tmpl_id', 'list_price' ) )
+            array( 'fields' => array( 'id', 'default_code', 'product_tmpl_id', 'list_price', 'x_studio_force_out_of_stock' ) )
         );
 
         if ( is_wp_error( $products ) || ! is_array( $products ) || empty( $products ) ) {
@@ -47,6 +46,7 @@ class OWSC_Stock_Sync {
         $odoo_tmpl_ids    = array();
         $tmpl_to_sku_map  = array();
         $sku_prices       = array(); 
+        $force_oos_map    = array(); // NEW: Store the override flag
         
         foreach ( $products as $p ) {
             if ( ! empty( $p['default_code'] ) ) {
@@ -62,6 +62,9 @@ class OWSC_Stock_Sync {
                 if ( isset( $p['list_price'] ) ) {
                     $sku_prices[ $sku ] = (float) $p['list_price'];
                 }
+
+                // NEW: Capture the boolean value
+                $force_oos_map[ $sku ] = ! empty( $p['x_studio_force_out_of_stock'] ) ? true : false;
             }
         }
 
@@ -195,7 +198,10 @@ class OWSC_Stock_Sync {
         $updated_price_count = 0;
 
         foreach ( $stock_totals as $sku => $qty ) {
-            $final_qty = max( 0, $qty ); 
+            // NEW: Check the override boolean before determining the final quantity
+            $is_forced_oos = isset( $force_oos_map[ $sku ] ) ? $force_oos_map[ $sku ] : false;
+            $final_qty = $is_forced_oos ? 0 : max( 0, $qty ); 
+            
             $status = $final_qty > 0 ? 'instock' : 'outofstock';
             
             $woo_product_id = wc_get_product_id_by_sku( $sku );
