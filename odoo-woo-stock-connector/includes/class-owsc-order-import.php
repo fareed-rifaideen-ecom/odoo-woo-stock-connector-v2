@@ -19,11 +19,26 @@ class OWSC_Order_Import {
         $order->update_meta_data( '_owsc_odoo_import_status', 'processing' );
         $order->save_meta_data();
 
-        // 2. Extract Customer Data
+        // --- NEW: Extract State Name & Code from WooCommerce ---
+        $country_code = $order->get_shipping_country() ?: $order->get_billing_country();
+        $state_code   = $order->get_shipping_state() ?: $order->get_billing_state();
+        
+        $states_list = WC()->countries->get_states( $country_code );
+        $state_name  = isset( $states_list[ $state_code ] ) ? $states_list[ $state_code ] : $state_code;
+
+        // 2. Extract Customer Data (UPDATED: Added State parameters & Name fallback)
         $customer_data = array(
-            'email' => $order->get_billing_email(),
-            'phone' => $order->get_billing_phone(),
-            'name'  => trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
+            'email'      => $order->get_billing_email(),
+            'phone'      => $order->get_billing_phone(),
+            // Prefer shipping name, fallback to billing name
+            'name'       => trim( $order->get_shipping_first_name() . ' ' . $order->get_shipping_last_name() ) ?: trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
+            'street'     => $order->get_shipping_address_1() ?: $order->get_billing_address_1(),
+            'street2'    => $order->get_shipping_address_2() ?: $order->get_billing_address_2(),
+            'city'       => $order->get_shipping_city() ?: $order->get_billing_city(),
+            'zip'        => $order->get_shipping_postcode() ?: $order->get_billing_postcode(),
+            'country'    => $country_code,
+            'state_code' => $state_code,
+            'state_name' => $state_name,
         );
 
         // 3. Extract Line Items & SKUs
@@ -34,7 +49,7 @@ class OWSC_Order_Import {
                 $items_data[] = array(
                     'sku'      => $product->get_sku(),
                     'quantity' => $item->get_quantity(),
-                    'price'    => $order->get_item_total( $item, false, false ), // Raw unit price
+                    'price'    => $order->get_item_total( $item, false, false ), 
                 );
             }
         }
@@ -65,7 +80,7 @@ class OWSC_Order_Import {
             return;
         }
 
-        // Step A: Resolve Customer
+        // Step A: Resolve Customer 
         $partner_id = $this->resolve_customer( $client, $config, $uid, $customer_data );
         if ( ! $partner_id ) {
             $order->add_order_note( 'Odoo Connector Exception: Could not resolve or create customer in Odoo.' );
@@ -91,11 +106,22 @@ class OWSC_Order_Import {
             $odoo_product_map[ $op['default_code'] ] = $op['id'];
         }
 
-        // Step C: Determine Warehouse Routing
+        // Step C: Determine Warehouse Routing (Dynamic Priority)
+        $shipping_methods = $order->get_shipping_methods();
+        $shipping_name    = reset( $shipping_methods ) ? reset( $shipping_methods )->get_name() : 'Delivery Around UAE';
+
+        $priority_string = $config['priority_uae'] ?: 'WH,MC,JM';
+        if ( stripos( $shipping_name, 'Jumeirah' ) !== false ) {
+            $priority_string = $config['priority_jm'] ?: 'JM,MC,WH';
+        } elseif ( stripos( $shipping_name, 'Motor City' ) !== false ) {
+            $priority_string = $config['priority_mc'] ?: 'MC,WH,JM';
+        }
+        $priority = array_map( 'trim', explode( ',', $priority_string ) );
+
         $warehouses = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
             'stock.warehouse', 'search_read',
-            array( array( array( 'code', 'in', array( 'WH', 'MC', 'JM' ) ) ) ),
+            array( array( array( 'code', 'in', $priority ) ) ),
             array( 'fields' => array( 'id', 'code', 'lot_stock_id' ) )
         );
 
@@ -115,7 +141,6 @@ class OWSC_Order_Import {
         $can_auto_confirm    = false;
         $target_code         = '';
 
-        // Only run routing calculation if auto-confirm toggle is checked
         if ( $is_auto_confirm_enabled && ! empty( $location_ids ) && ! empty( $odoo_product_map ) ) {
             $quants = $client->execute_kw(
                 $config['database'], $uid, $config['api_key'],
@@ -141,8 +166,6 @@ class OWSC_Order_Import {
                 }
             }
 
-            // Evaluate priority: WH -> MC -> JM
-            $priority = array( 'WH', 'MC', 'JM' );
             foreach ( $priority as $code ) {
                 if ( isset( $wh_map[ $code ] ) ) {
                     $wh_id  = $wh_map[ $code ]['id'];
@@ -170,11 +193,10 @@ class OWSC_Order_Import {
             }
         }
 
-        // Fallback or if auto-confirm is toggled OFF
         if ( ! $target_warehouse_id ) {
-            $target_warehouse_id = $wh_map['WH']['id'] ?? ( $warehouses[0]['id'] ?? 1 );
+            $target_warehouse_id = $wh_map[ $priority[0] ]['id'] ?? ( $warehouses[0]['id'] ?? 1 );
             $can_auto_confirm    = false;
-            $target_code         = 'WH (Default)';
+            $target_code         = $priority[0] . ' (Default/Split)';
             if ( $is_auto_confirm_enabled ) {
                 $order->add_order_note( 'Odoo Connector Notice: Stock split across multiple locations or unavailable. Routed to default warehouse for manual review.' );
             }
@@ -189,8 +211,7 @@ class OWSC_Order_Import {
             }
             
             $order_lines[] = array(
-                0, 
-                0,
+                0, 0,
                 array(
                     'product_id'      => $odoo_product_map[ $item['sku'] ],
                     'product_uom_qty' => $item['quantity'],
@@ -199,7 +220,49 @@ class OWSC_Order_Import {
             );
         }
 
-        // --- NEW: Step E: Get the "Online Order" tag for the Sales Order ---
+        // Step D.1: Add Delivery/Payment Notes 
+        $payment_title = $order->get_payment_method_title() ?: 'Unknown Payment';
+        $order_lines[] = array( 0, 0, array(
+            'display_type' => 'line_note',
+            'name'         => sprintf( "Delivery Method: %s\nPayment Method: %s", $shipping_name, $payment_title )
+        ) );
+
+        // Step D.2: Add Dynamic Delivery Charges 
+        $shipping_total = (float) $order->get_shipping_total();
+        if ( $shipping_total > 0 ) {
+            $delivery_sku = '';
+            $delivery_qty = 1;
+            $unit_price   = 0;
+
+            if ( $shipping_total % 150 == 0 ) {
+                $delivery_sku = 'GNDUAE1';
+                $delivery_qty = $shipping_total / 150;
+                $unit_price   = 150.00;
+            } elseif ( $shipping_total == 45 ) {
+                $delivery_sku = 'GNDUAE2';
+                $delivery_qty = 1;
+                $unit_price   = 45.00;
+            }
+
+            if ( $delivery_sku ) {
+                $del_product = $client->execute_kw(
+                    $config['database'], $uid, $config['api_key'],
+                    'product.product', 'search_read',
+                    array( array( array( 'default_code', '=', $delivery_sku ) ) ),
+                    array( 'fields' => array( 'id' ), 'limit' => 1 )
+                );
+                
+                if ( ! is_wp_error( $del_product ) && ! empty( $del_product ) ) {
+                    $order_lines[] = array( 0, 0, array(
+                        'product_id'      => (int) $del_product[0]['id'],
+                        'product_uom_qty' => $delivery_qty,
+                        'price_unit'      => $unit_price,
+                    ) );
+                }
+            }
+        }
+
+        // Step E: Get the "Online Order" tags and Sales Team
         $sale_tag_ids = array();
         $sale_tags = $client->execute_kw( 
             $config['database'], $uid, $config['api_key'], 
@@ -211,6 +274,17 @@ class OWSC_Order_Import {
             $sale_tag_ids[] = (int) $sale_tags[0]['id'];
         }
 
+        $team_id = null;
+        $sales_teams = $client->execute_kw(
+            $config['database'], $uid, $config['api_key'],
+            'crm.team', 'search_read',
+            array( array( array( 'name', '=', 'Online Order' ) ) ),
+            array( 'fields' => array( 'id' ), 'limit' => 1 )
+        );
+        if ( ! is_wp_error( $sales_teams ) && ! empty( $sales_teams ) ) {
+            $team_id = (int) $sales_teams[0]['id'];
+        }
+
         // Step F: Create Sale Order
         $sale_order_data = array(
             'partner_id'       => $partner_id,
@@ -219,9 +293,11 @@ class OWSC_Order_Import {
             'order_line'       => $order_lines,
         );
 
-        // Apply the tag to the quotation payload if we found it
         if ( ! empty( $sale_tag_ids ) ) {
             $sale_order_data['tag_ids'] = array( array( 6, 0, $sale_tag_ids ) );
+        }
+        if ( $team_id ) {
+            $sale_order_data['team_id'] = $team_id;
         }
 
         $sale_order_id = $client->execute_kw( 
@@ -235,7 +311,7 @@ class OWSC_Order_Import {
             return;
         }
 
-        // Step G: Execute Auto-Confirmation (If enabled and valid)
+        // Step G: Execute Auto-Confirmation
         if ( $is_auto_confirm_enabled && $can_auto_confirm ) {
             $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
@@ -247,14 +323,15 @@ class OWSC_Order_Import {
             $order->add_order_note( sprintf( 'Odoo Connector Success: Created Draft Sale Order ID %d in Odoo (Routed to %s). Pending manual confirmation.', $sale_order_id, $target_code ) );
         }
 
-        // Mark completed
         $order->update_meta_data( '_owsc_odoo_import_status', 'completed' );
         $order->update_meta_data( '_owsc_odoo_sale_order_id', $sale_order_id );
         $order->save_meta_data();
     }
 
     private function resolve_customer( $client, $config, $uid, $customer_data ): int {
-        // Priority 1: Match by exact Email
+        $partner_id = 0;
+
+        // 1. Match by Email
         if ( ! empty( $customer_data['email'] ) ) {
             $partners = $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
@@ -263,12 +340,12 @@ class OWSC_Order_Import {
                 array( 'fields' => array( 'id' ), 'limit' => 1 ) 
             );
             if ( ! is_wp_error( $partners ) && ! empty( $partners ) ) {
-                return (int) $partners[0]['id'];
+                $partner_id = (int) $partners[0]['id'];
             }
         }
 
-        // Priority 2: Match by exact Phone
-        if ( ! empty( $customer_data['phone'] ) ) {
+        // 2. Match by Phone
+        if ( ! $partner_id && ! empty( $customer_data['phone'] ) ) {
             $partners = $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
                 'res.partner', 'search_read', 
@@ -276,43 +353,95 @@ class OWSC_Order_Import {
                 array( 'fields' => array( 'id' ), 'limit' => 1 ) 
             );
             if ( ! is_wp_error( $partners ) && ! empty( $partners ) ) {
-                return (int) $partners[0]['id'];
+                $partner_id = (int) $partners[0]['id'];
             }
         }
 
-        // Priority 3: Create new Contact if no match found
-        $tag_ids = array();
-        $tags = $client->execute_kw( 
-            $config['database'], $uid, $config['api_key'], 
-            'res.partner.category', 'search_read', 
-            array( array( array( 'name', '=', 'Online Order' ) ) ), 
-            array( 'fields' => array( 'id' ), 'limit' => 1 ) 
-        );
-        if ( ! is_wp_error( $tags ) && ! empty( $tags ) ) {
-            $tag_ids[] = (int) $tags[0]['id'];
+        // 3. Map Country ID
+        $country_id = null;
+        if ( ! empty( $customer_data['country'] ) ) {
+            $countries = $client->execute_kw(
+                $config['database'], $uid, $config['api_key'],
+                'res.country', 'search_read',
+                array( array( array( 'code', '=', $customer_data['country'] ) ) ),
+                array( 'fields' => array( 'id' ), 'limit' => 1 )
+            );
+            if ( ! is_wp_error( $countries ) && ! empty( $countries ) ) {
+                $country_id = (int) $countries[0]['id'];
+            }
         }
 
-        $partner_payload = array(
-            'name'   => ! empty( $customer_data['name'] ) ? $customer_data['name'] : 'WooCommerce Guest',
-            'email'  => $customer_data['email'],
-            'phone'  => $customer_data['phone'],
-            'mobile' => $customer_data['phone'],
-        );
-
-        if ( ! empty( $tag_ids ) ) {
-            $partner_payload['category_id'] = array( array( 6, 0, $tag_ids ) ); 
+        // --- NEW: 3.5 Map State ID (Searching Odoo's res.country.state database) ---
+        $state_id = null;
+        if ( $country_id && ( ! empty( $customer_data['state_code'] ) || ! empty( $customer_data['state_name'] ) ) ) {
+            $states = $client->execute_kw(
+                $config['database'], $uid, $config['api_key'],
+                'res.country.state', 'search_read',
+                array( array(
+                    array( 'country_id', '=', $country_id ),
+                    '|',
+                    array( 'code', '=', $customer_data['state_code'] ),
+                    array( 'name', 'ilike', $customer_data['state_name'] ) // Matches "Dubai", "Abu Dhabi", etc.
+                ) ),
+                array( 'fields' => array( 'id' ), 'limit' => 1 )
+            );
+            if ( ! is_wp_error( $states ) && ! empty( $states ) ) {
+                $state_id = (int) $states[0]['id'];
+            }
         }
 
-        $new_partner_id = $client->execute_kw( 
-            $config['database'], $uid, $config['api_key'], 
-            'res.partner', 'create', 
-            array( $partner_payload ) 
+        // 4. Build Address Payload (UPDATED: Added 'name' and 'state_id')
+        $address_payload = array(
+            'name'    => $customer_data['name'] ?: 'WooCommerce Guest',
+            'street'  => $customer_data['street'],
+            'street2' => $customer_data['street2'],
+            'city'    => $customer_data['city'],
+            'zip'     => $customer_data['zip'],
+            'phone'   => $customer_data['phone'],
+            'mobile'  => $customer_data['phone'],
         );
 
-        if ( ! is_wp_error( $new_partner_id ) && is_int( $new_partner_id ) ) {
-            return $new_partner_id;
+        if ( $country_id ) {
+            $address_payload['country_id'] = $country_id;
+        }
+        if ( $state_id ) {
+            $address_payload['state_id'] = $state_id; // Connects the relational State field
         }
 
-        return 0; // Failed to resolve or create
+        // 5. Update Existing OR Create New Contact
+        if ( $partner_id > 0 ) {
+            // UPDATED: Because 'name' is in the payload, this will update BOTH Address AND Name
+            $client->execute_kw( 
+                $config['database'], $uid, $config['api_key'], 
+                'res.partner', 'write', 
+                array( array( $partner_id ), $address_payload ) 
+            );
+            return $partner_id;
+            
+        } else {
+            $address_payload['email'] = $customer_data['email'];
+
+            $tags = $client->execute_kw( 
+                $config['database'], $uid, $config['api_key'], 
+                'res.partner.category', 'search_read', 
+                array( array( array( 'name', '=', 'Online Order' ) ) ), 
+                array( 'fields' => array( 'id' ), 'limit' => 1 ) 
+            );
+            if ( ! is_wp_error( $tags ) && ! empty( $tags ) ) {
+                $address_payload['category_id'] = array( array( 6, 0, array( (int) $tags[0]['id'] ) ) ); 
+            }
+
+            $new_partner_id = $client->execute_kw( 
+                $config['database'], $uid, $config['api_key'], 
+                'res.partner', 'create', 
+                array( $address_payload ) 
+            );
+
+            if ( ! is_wp_error( $new_partner_id ) && is_int( $new_partner_id ) ) {
+                return $new_partner_id;
+            }
+
+            return 0; 
+        }
     }
 }

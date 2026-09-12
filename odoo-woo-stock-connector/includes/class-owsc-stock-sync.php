@@ -4,7 +4,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 class OWSC_Stock_Sync {
-    public function run_sync(): array {
+    // Natively accepts the Odoo Product ID
+    public function run_sync( string $target_sku = '', int $target_odoo_product_id = 0 ): array {
         $config = OWSCPluginV2::configuration();
         if ( ! $config['url'] || ! $config['database'] || ! $config['username'] || ! $config['api_key'] ) {
             return array( 'status' => 'error', 'message' => 'Odoo configuration incomplete. Cannot run sync.' );
@@ -17,22 +18,35 @@ class OWSC_Stock_Sync {
             return array( 'status' => 'error', 'message' => 'Odoo authentication failed. Cannot run sync.' );
         }
 
+        $domain = array( 
+            array( 'x_studio_available_for_woocommerce_sync', '=', true ) 
+        );
+        
+        // Dynamically target either SKU or Odoo Product ID
+        if ( ! empty( $target_sku ) ) {
+            $domain[] = array( 'default_code', '=', $target_sku );
+        } elseif ( $target_odoo_product_id > 0 ) {
+            $domain[] = array( 'id', '=', $target_odoo_product_id );
+        }
+
         // 1. Fetch eligible Odoo products
         $products = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
             'product.product', 'search_read',
-            array( array( array( 'x_studio_available_for_woocommerce_sync', '=', true ) ) ),
-            array( 'fields' => array( 'id', 'default_code', 'product_tmpl_id' ) )
+            array( $domain ),
+            array( 'fields' => array( 'id', 'default_code', 'product_tmpl_id', 'list_price' ) )
         );
 
         if ( is_wp_error( $products ) || ! is_array( $products ) || empty( $products ) ) {
-            return array( 'status' => 'info', 'message' => 'No eligible products found for sync in Odoo.' );
+            $msg = ( $target_sku || $target_odoo_product_id ) ? 'Target product not found or not enabled for sync in Odoo.' : 'No eligible products found for sync in Odoo.';
+            return array( 'status' => 'info', 'message' => $msg );
         }
 
         $product_map      = array(); 
         $odoo_product_ids = array();
         $odoo_tmpl_ids    = array();
         $tmpl_to_sku_map  = array();
+        $sku_prices       = array(); 
         
         foreach ( $products as $p ) {
             if ( ! empty( $p['default_code'] ) ) {
@@ -43,6 +57,10 @@ class OWSC_Stock_Sync {
                 if ( isset( $p['product_tmpl_id'][0] ) ) {
                     $odoo_tmpl_ids[] = $p['product_tmpl_id'][0];
                     $tmpl_to_sku_map[ $p['product_tmpl_id'][0] ] = $sku;
+                }
+
+                if ( isset( $p['list_price'] ) ) {
+                    $sku_prices[ $sku ] = (float) $p['list_price'];
                 }
             }
         }
@@ -85,7 +103,7 @@ class OWSC_Stock_Sync {
             }
         }
 
-        // 3.5 Dynamic Subtraction for Unconfirmed Drafts
+        // 3.5 Subtract UNCONFIRMED Draft/Sent Orders Only
         $tag_ids = array();
         $tags = $client->execute_kw( 
             $config['database'], $uid, $config['api_key'], 
@@ -135,14 +153,11 @@ class OWSC_Stock_Sync {
             }
         }
 
-        // --- NEW: 3.8 Fetch Prices using Explicit Pricelist ID ---
-        $sku_prices = array();
-        $pricelist_diagnostic = '';
-        
+        // 3.8 Fetch Prices using Explicit Pricelist ID
+        $pricelist_diagnostic = ' [Standard Price Sync Active]';
         $pricelist_id = isset( $config['pricelist_id'] ) ? (int) $config['pricelist_id'] : 0;
         
         if ( $config['sync_price'] === 'yes' && $pricelist_id > 0 ) {
-            
             $pricelist_items = $client->execute_kw(
                 $config['database'], $uid, $config['api_key'],
                 'product.pricelist.item', 'search_read',
@@ -156,7 +171,7 @@ class OWSC_Stock_Sync {
             );
 
             if ( ! is_wp_error( $pricelist_items ) && is_array( $pricelist_items ) ) {
-                $pricelist_diagnostic = sprintf( ' [Pricelist ID %d Connected: Found %d price rules]', $pricelist_id, count( $pricelist_items ) );
+                $pricelist_diagnostic = sprintf( ' [Pricelist ID %d Connected: Found %d rules]', $pricelist_id, count( $pricelist_items ) );
                 
                 foreach ( $pricelist_items as $item ) {
                     $price = isset( $item['fixed_price'] ) ? (float) $item['fixed_price'] : 0;
@@ -164,12 +179,10 @@ class OWSC_Stock_Sync {
 
                     if ( ! empty( $item['product_id'][0] ) && isset( $product_map[ $item['product_id'][0] ] ) ) {
                         $sku = $product_map[ $item['product_id'][0] ];
-                        $sku_prices[ $sku ] = $price;
+                        $sku_prices[ $sku ] = $price; 
                     } elseif ( ! empty( $item['product_tmpl_id'][0] ) && isset( $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ] ) ) {
                         $sku = $tmpl_to_sku_map[ $item['product_tmpl_id'][0] ];
-                        if ( ! isset( $sku_prices[ $sku ] ) ) {
-                            $sku_prices[ $sku ] = $price;
-                        }
+                        $sku_prices[ $sku ] = $price; 
                     }
                 }
             } else {
@@ -191,7 +204,6 @@ class OWSC_Stock_Sync {
                 if ( $product ) {
                     $product_changed = false;
 
-                    // Update Stock
                     if ( $product->get_manage_stock() && (float) $product->get_stock_quantity() !== (float) $final_qty ) {
                         $product->set_stock_quantity( $final_qty );
                         $product->set_stock_status( $status );
@@ -199,23 +211,28 @@ class OWSC_Stock_Sync {
                         $product_changed = true;
                     }
 
-                    // Update Price (Force updating both Regular Price and Active Price)
                     if ( $config['sync_price'] === 'yes' && isset( $sku_prices[ $sku ] ) ) {
-                        $target_price = (string) $sku_prices[ $sku ];
-                        if ( $product->get_regular_price() !== $target_price ) {
-                            $product->set_regular_price( $target_price );
-                            $product->set_price( $target_price ); 
+                        $target_price  = (float) $sku_prices[ $sku ];
+                        $current_price = (float) $product->get_regular_price();
+                        
+                        if ( $current_price !== $target_price ) {
+                            $product->set_regular_price( (string) $target_price );
+                            $product->set_price( (string) $target_price ); 
                             $updated_price_count++;
                             $product_changed = true;
                         }
                     }
 
-                    // Save if modified
                     if ( $product_changed ) {
                         $product->save();
                     }
                 }
             }
+        }
+
+        // Only update the 'Last Sync' timestamp if this was a full catalog run
+        if ( empty( $target_sku ) && empty( $target_odoo_product_id ) ) {
+            update_option( 'owsc_last_sync_time', gmdate('Y-m-d H:i:s') );
         }
 
         return array(
