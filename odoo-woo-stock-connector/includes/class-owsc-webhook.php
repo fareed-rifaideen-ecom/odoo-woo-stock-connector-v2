@@ -21,36 +21,35 @@ class OWSC_Webhook {
         $config = OWSCPluginV2::configuration();
         $token  = $request->get_param( 'token' );
         
-        // Generate a secure, unique token based on your configuration
         $expected_token = substr( md5( $config['url'] . $config['username'] ), 0, 16 );
-        
         return $token === $expected_token;
     }
 
     public function handle_webhook( \WP_REST_Request $request ): \WP_REST_Response {
-        // Parse the incoming JSON payload from Odoo
-        $params = $request->get_json_params();
-        $target_sku = isset( $params['sku'] ) ? sanitize_text_field( $params['sku'] ) : '';
+        $params = $request->get_json_params() ?: array();
+        
+        // Extract Product ID from Odoo's native webhook payload 
+        $odoo_product_id = 0;
+        if ( isset( $params['product_id'] ) && is_array( $params['product_id'] ) && ! empty( $params['product_id'][0] ) ) {
+            $odoo_product_id = (int) $params['product_id'][0];
+        }
 
-        // Dynamic Locking: Use a specific lock if a SKU is provided, otherwise use the global lock
-        $lock_name = $target_sku ? 'owsc_webhook_lock_' . md5( $target_sku ) : 'owsc_webhook_lock';
+        // Dynamic Locking based on Odoo Product ID
+        $lock_name = $odoo_product_id > 0 ? 'owsc_webhook_lock_pid_' . $odoo_product_id : 'owsc_webhook_lock';
 
-        // Prevent concurrent overlapping runs for the exact same product/sync
         if ( get_transient( $lock_name ) ) {
             return new \WP_REST_Response( array( 
                 'status'  => 'skipped', 
-                'message' => sprintf( 'Sync already in progress for %s. Batching request.', $target_sku ?: 'full catalog' ) 
+                'message' => sprintf( 'Sync already in progress for %s. Batching request.', $odoo_product_id > 0 ? 'Product ID ' . $odoo_product_id : 'full catalog' ) 
             ), 200 );
         }
         
-        // Lock for 30 seconds
         set_transient( $lock_name, true, 30 ); 
         
-        // Execute the Sync engine, passing the specific SKU (if one exists)
         $sync = new OWSC_Stock_Sync();
-        $result = $sync->run_sync( $target_sku );
+        // Pass the exact Odoo Product ID to the sync engine
+        $result = $sync->run_sync( '', $odoo_product_id ); 
         
-        // Release the lock
         delete_transient( $lock_name );
         
         return new \WP_REST_Response( $result, 200 );
