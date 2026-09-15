@@ -19,18 +19,17 @@ class OWSC_Order_Import {
         $order->update_meta_data( '_owsc_odoo_import_status', 'processing' );
         $order->save_meta_data();
 
-        // --- NEW: Extract State Name & Code from WooCommerce ---
+        // Extract State Name & Code from WooCommerce
         $country_code = $order->get_shipping_country() ?: $order->get_billing_country();
         $state_code   = $order->get_shipping_state() ?: $order->get_billing_state();
         
         $states_list = WC()->countries->get_states( $country_code );
         $state_name  = isset( $states_list[ $state_code ] ) ? $states_list[ $state_code ] : $state_code;
 
-        // 2. Extract Customer Data (UPDATED: Added State parameters & Name fallback)
+        // 2. Extract Customer Data
         $customer_data = array(
             'email'      => $order->get_billing_email(),
             'phone'      => $order->get_billing_phone(),
-            // Prefer shipping name, fallback to billing name
             'name'       => trim( $order->get_shipping_first_name() . ' ' . $order->get_shipping_last_name() ) ?: trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
             'street'     => $order->get_shipping_address_1() ?: $order->get_billing_address_1(),
             'street2'    => $order->get_shipping_address_2() ?: $order->get_billing_address_2(),
@@ -59,7 +58,7 @@ class OWSC_Order_Import {
             return;
         }
 
-        // 4. Execute Phase 2 Import
+        // 4. Execute Import
         $this->import_to_odoo( $order, $customer_data, $items_data );
     }
 
@@ -142,40 +141,68 @@ class OWSC_Order_Import {
         $target_code         = '';
 
         if ( $is_auto_confirm_enabled && ! empty( $location_ids ) && ! empty( $odoo_product_map ) ) {
+            
+            // --- ROBUST FIX: Map every location precisely to its Warehouse ---
+            $loc_to_wh = array();
+            foreach ( $warehouses as $wh ) {
+                if ( isset( $wh['lot_stock_id'][0] ) ) {
+                    $wh_id = $wh['id'];
+                    $root_loc_id = $wh['lot_stock_id'][0];
+                    
+                    // Fetch all child locations for THIS specific warehouse root
+                    $child_locs = $client->execute_kw(
+                        $config['database'], $uid, $config['api_key'],
+                        'stock.location', 'search',
+                        array( array( array( 'id', 'child_of', $root_loc_id ) ) )
+                    );
+                    
+                    if ( ! is_wp_error( $child_locs ) && is_array( $child_locs ) ) {
+                        foreach ( $child_locs as $c_id ) {
+                            $loc_to_wh[ $c_id ] = $wh_id;
+                        }
+                    }
+                }
+            }
+
+            // Fetch Quants for every associated child location
             $quants = $client->execute_kw(
                 $config['database'], $uid, $config['api_key'],
                 'stock.quant', 'search_read',
                 array( array(
                     array( 'product_id', 'in', array_values( $odoo_product_map ) ),
-                    array( 'location_id', 'in', $location_ids )
+                    array( 'location_id', 'in', array_keys( $loc_to_wh ) )
                 ) ),
                 array( 'fields' => array( 'product_id', 'location_id', 'quantity', 'reserved_quantity' ) )
             );
 
+            // Aggregate total stock back to the parent warehouse
             $stock_levels = array();
             if ( ! is_wp_error( $quants ) && is_array( $quants ) ) {
                 foreach ( $quants as $q ) {
                     $loc_id  = $q['location_id'][0] ?? 0;
                     $prod_id = $q['product_id'][0] ?? 0;
-                    $avail   = (float) ($q['quantity'] ?? 0) - (float) ($q['reserved_quantity'] ?? 0);
+                    $wh_id   = $loc_to_wh[ $loc_id ] ?? 0;
 
-                    if ( ! isset( $stock_levels[ $loc_id ][ $prod_id ] ) ) {
-                        $stock_levels[ $loc_id ][ $prod_id ] = 0;
+                    if ( $wh_id > 0 ) {
+                        $avail = (float) ($q['quantity'] ?? 0) - (float) ($q['reserved_quantity'] ?? 0);
+                        if ( ! isset( $stock_levels[ $wh_id ][ $prod_id ] ) ) {
+                            $stock_levels[ $wh_id ][ $prod_id ] = 0;
+                        }
+                        $stock_levels[ $wh_id ][ $prod_id ] += $avail;
                     }
-                    $stock_levels[ $loc_id ][ $prod_id ] += $avail;
                 }
             }
 
+            // Check dynamic priority
             foreach ( $priority as $code ) {
                 if ( isset( $wh_map[ $code ] ) ) {
                     $wh_id  = $wh_map[ $code ]['id'];
-                    $loc_id = $wh_map[ $code ]['lot_stock_id'][0] ?? 0;
 
                     $can_fulfill_all = true;
                     foreach ( $items_data as $item ) {
                         $prod_id = $odoo_product_map[ $item['sku'] ] ?? 0;
                         $req_qty = $item['quantity'];
-                        $avail   = $stock_levels[ $loc_id ][ $prod_id ] ?? 0;
+                        $avail   = $stock_levels[ $wh_id ][ $prod_id ] ?? 0;
 
                         if ( $avail < $req_qty ) {
                             $can_fulfill_all = false;
@@ -193,6 +220,7 @@ class OWSC_Order_Import {
             }
         }
 
+        // Fallback if no warehouse has full stock (or auto-confirm is disabled)
         if ( ! $target_warehouse_id ) {
             $target_warehouse_id = $wh_map[ $priority[0] ]['id'] ?? ( $warehouses[0]['id'] ?? 1 );
             $can_auto_confirm    = false;
@@ -331,7 +359,6 @@ class OWSC_Order_Import {
     private function resolve_customer( $client, $config, $uid, $customer_data ): int {
         $partner_id = 0;
 
-        // 1. Match by Email
         if ( ! empty( $customer_data['email'] ) ) {
             $partners = $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
@@ -344,7 +371,6 @@ class OWSC_Order_Import {
             }
         }
 
-        // 2. Match by Phone
         if ( ! $partner_id && ! empty( $customer_data['phone'] ) ) {
             $partners = $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
@@ -357,7 +383,6 @@ class OWSC_Order_Import {
             }
         }
 
-        // 3. Map Country ID
         $country_id = null;
         if ( ! empty( $customer_data['country'] ) ) {
             $countries = $client->execute_kw(
@@ -371,7 +396,6 @@ class OWSC_Order_Import {
             }
         }
 
-        // --- NEW: 3.5 Map State ID (Searching Odoo's res.country.state database) ---
         $state_id = null;
         if ( $country_id && ( ! empty( $customer_data['state_code'] ) || ! empty( $customer_data['state_name'] ) ) ) {
             $states = $client->execute_kw(
@@ -381,7 +405,7 @@ class OWSC_Order_Import {
                     array( 'country_id', '=', $country_id ),
                     '|',
                     array( 'code', '=', $customer_data['state_code'] ),
-                    array( 'name', 'ilike', $customer_data['state_name'] ) // Matches "Dubai", "Abu Dhabi", etc.
+                    array( 'name', 'ilike', $customer_data['state_name'] ) 
                 ) ),
                 array( 'fields' => array( 'id' ), 'limit' => 1 )
             );
@@ -390,7 +414,6 @@ class OWSC_Order_Import {
             }
         }
 
-        // 4. Build Address Payload (UPDATED: Added 'name' and 'state_id')
         $address_payload = array(
             'name'    => $customer_data['name'] ?: 'WooCommerce Guest',
             'street'  => $customer_data['street'],
@@ -405,12 +428,10 @@ class OWSC_Order_Import {
             $address_payload['country_id'] = $country_id;
         }
         if ( $state_id ) {
-            $address_payload['state_id'] = $state_id; // Connects the relational State field
+            $address_payload['state_id'] = $state_id; 
         }
 
-        // 5. Update Existing OR Create New Contact
         if ( $partner_id > 0 ) {
-            // UPDATED: Because 'name' is in the payload, this will update BOTH Address AND Name
             $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
                 'res.partner', 'write', 
