@@ -54,7 +54,6 @@ function owsc_log_sync_event( string $trigger_source, string $message, string $s
     global $wpdb;
     $table_name = $wpdb->prefix . 'owsc_logs';
 
-    // 1. Insert the new log
     $wpdb->insert( $table_name, array(
         'created_at'     => current_time( 'mysql' ),
         'trigger_source' => $trigger_source,
@@ -62,7 +61,6 @@ function owsc_log_sync_event( string $trigger_source, string $message, string $s
         'message'        => sanitize_text_field( $message )
     ) );
 
-    // 2. Garbage Collection: Prune logs older than 7 days
     $wpdb->query( $wpdb->prepare(
         "DELETE FROM $table_name WHERE created_at < %s",
         gmdate( 'Y-m-d H:i:s', strtotime( '-7 days' ) )
@@ -115,18 +113,19 @@ final class OWSCPluginV2 {
     public static function configuration(): array {
         $settings = get_option( self::OPTION_NAME, array() );
         return array(
-            'url'            => (string) ( $settings['url'] ?? '' ),
-            'database'       => (string) ( $settings['database'] ?? '' ),
-            'username'       => (string) ( $settings['username'] ?? '' ),
-            'api_key'        => (string) ( $settings['api_key'] ?? '' ),
-            'sync_enabled'   => (string) ( $settings['sync_enabled'] ?? 'no' ),
-            'cron_interval'  => (int) ( $settings['cron_interval'] ?? 5 ), 
-            'priority_jm'    => (string) ( $settings['priority_jm'] ?? 'JM,MC,WH' ), 
-            'priority_mc'    => (string) ( $settings['priority_mc'] ?? 'MC,WH,JM' ), 
-            'priority_uae'   => (string) ( $settings['priority_uae'] ?? 'WH,MC,JM' ), 
-            'auto_confirm'   => (string) ( $settings['auto_confirm'] ?? 'no' ),
-            'sync_price'     => (string) ( $settings['sync_price'] ?? 'no' ),
-            'pricelist_id'   => (int) ( $settings['pricelist_id'] ?? 0 ),
+            'url'                => (string) ( $settings['url'] ?? '' ),
+            'database'           => (string) ( $settings['database'] ?? '' ),
+            'username'           => (string) ( $settings['username'] ?? '' ),
+            'api_key'            => (string) ( $settings['api_key'] ?? '' ),
+            'sync_enabled'       => (string) ( $settings['sync_enabled'] ?? 'no' ),
+            'cron_interval'      => (int) ( $settings['cron_interval'] ?? 5 ), 
+            'priority_jm'        => (string) ( $settings['priority_jm'] ?? 'JM,MC,WH' ), 
+            'priority_mc'        => (string) ( $settings['priority_mc'] ?? 'MC,WH,JM' ), 
+            'priority_uae'       => (string) ( $settings['priority_uae'] ?? 'WH,MC,JM' ), 
+            'auto_confirm'       => (string) ( $settings['auto_confirm'] ?? 'no' ),
+            'sync_price'         => (string) ( $settings['sync_price'] ?? 'no' ),
+            'pricelist_id'       => (int) ( $settings['pricelist_id'] ?? 0 ),
+            'customer_sync_mode' => (string) ( $settings['customer_sync_mode'] ?? 'strict_reuse' ),
         );
     }
 
@@ -150,7 +149,6 @@ final class OWSCPluginV2 {
             array( __CLASS__, 'render_page' ) 
         );
 
-        // NEW: Submenu page for the Sync Logs
         add_submenu_page( 
             'owsc-connector', 
             'Sync Logs', 
@@ -211,6 +209,16 @@ final class OWSCPluginV2 {
                         <th scope="row"><label for="odoo_api_key">Odoo API Key</label></th>
                         <td>
                             <input name="api_key" id="odoo_api_key" type="password" class="regular-text" value="" placeholder="<?php echo $config['api_key'] ? 'Saved (hidden)' : 'Enter API key'; ?>">
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row"><label for="customer_sync_mode">Customer Sync Mode</label></th>
+                        <td>
+                            <select name="customer_sync_mode" id="customer_sync_mode">
+                                <option value="strict_reuse" <?php selected( $config['customer_sync_mode'], 'strict_reuse' ); ?>>Option 2: Strict Fallback (Reuse matched contact, never overwrite)</option>
+                                <option value="create_child" <?php selected( $config['customer_sync_mode'], 'create_child' ); ?>>Option 1: Create Child Contact (For alternative delivery addresses)</option>
+                            </select>
+                            <p class="description">Select how Odoo handles WooCommerce shipping addresses that differ from the main customer profile.</p>
                         </td>
                     </tr>
                     <tr>
@@ -287,12 +295,10 @@ final class OWSCPluginV2 {
         <?php
     }
 
-    // NEW: Renders the visual log table in the WP admin
     public static function render_log_page(): void {
         global $wpdb;
         $table_name = $wpdb->prefix . 'owsc_logs';
         
-        // Failsafe if the database hasn't been created yet
         if ( $wpdb->get_var("SHOW TABLES LIKE '$table_name'") != $table_name ) {
             echo '<div class="wrap"><h1>Odoo Sync Logs</h1><div class="notice notice-error"><p>The log database table is missing. <strong>Please deactivate and immediately reactivate the plugin to generate it.</strong></p></div></div>';
             return;
@@ -343,18 +349,19 @@ final class OWSCPluginV2 {
         $submitted_key = isset( $_POST['api_key'] ) ? trim( (string) wp_unslash( $_POST['api_key'] ) ) : '';
         
         $new_config = array(
-            'url'            => esc_url_raw( trim( (string) wp_unslash( $_POST['url'] ?? '' ) ) ),
-            'database'       => sanitize_text_field( wp_unslash( $_POST['database'] ?? '' ) ),
-            'username'       => sanitize_text_field( wp_unslash( $_POST['username'] ?? '' ) ),
-            'api_key'        => $submitted_key ? $submitted_key : $old_config['api_key'],
-            'sync_enabled'   => isset( $_POST['sync_enabled'] ) ? 'yes' : 'no',
-            'cron_interval'  => max( 1, (int) ( $_POST['cron_interval'] ?? 5 ) ), 
-            'priority_jm'    => sanitize_text_field( wp_unslash( $_POST['priority_jm'] ?? 'JM,MC,WH' ) ), 
-            'priority_mc'    => sanitize_text_field( wp_unslash( $_POST['priority_mc'] ?? 'MC,WH,JM' ) ), 
-            'priority_uae'   => sanitize_text_field( wp_unslash( $_POST['priority_uae'] ?? 'WH,MC,JM' ) ), 
-            'auto_confirm'   => isset( $_POST['auto_confirm'] ) ? 'yes' : 'no',
-            'sync_price'     => isset( $_POST['sync_price'] ) ? 'yes' : 'no',
-            'pricelist_id'   => (int) ( $_POST['pricelist_id'] ?? 0 ),
+            'url'                => esc_url_raw( trim( (string) wp_unslash( $_POST['url'] ?? '' ) ) ),
+            'database'           => sanitize_text_field( wp_unslash( $_POST['database'] ?? '' ) ),
+            'username'           => sanitize_text_field( wp_unslash( $_POST['username'] ?? '' ) ),
+            'api_key'            => $submitted_key ? $submitted_key : $old_config['api_key'],
+            'sync_enabled'       => isset( $_POST['sync_enabled'] ) ? 'yes' : 'no',
+            'cron_interval'      => max( 1, (int) ( $_POST['cron_interval'] ?? 5 ) ), 
+            'priority_jm'        => sanitize_text_field( wp_unslash( $_POST['priority_jm'] ?? 'JM,MC,WH' ) ), 
+            'priority_mc'        => sanitize_text_field( wp_unslash( $_POST['priority_mc'] ?? 'MC,WH,JM' ) ), 
+            'priority_uae'       => sanitize_text_field( wp_unslash( $_POST['priority_uae'] ?? 'WH,MC,JM' ) ), 
+            'auto_confirm'       => isset( $_POST['auto_confirm'] ) ? 'yes' : 'no',
+            'sync_price'         => isset( $_POST['sync_price'] ) ? 'yes' : 'no',
+            'pricelist_id'       => (int) ( $_POST['pricelist_id'] ?? 0 ),
+            'customer_sync_mode' => sanitize_text_field( wp_unslash( $_POST['customer_sync_mode'] ?? 'strict_reuse' ) ),
         );
 
         update_option( self::OPTION_NAME, $new_config, false );
@@ -377,7 +384,6 @@ final class OWSCPluginV2 {
         $sync_service = new OWSC_Stock_Sync();
         $result = $sync_service->run_sync();
         
-        // NEW: Log the Manual Sync
         $status = isset( $result['status'] ) ? $result['status'] : 'info';
         owsc_log_sync_event( 'Manual Sync', $result['message'], $status );
 
@@ -392,7 +398,6 @@ final class OWSCPluginV2 {
             $sync_service = new OWSC_Stock_Sync();
             $result = $sync_service->run_sync();
             
-            // NEW: Log the Cron execution
             $status = isset( $result['status'] ) ? $result['status'] : 'info';
             owsc_log_sync_event( 'WP-Cron', $result['message'], $status );
         }
