@@ -308,9 +308,9 @@ class OWSC_Order_Import {
             $team_id = (int) $sales_teams[0]['id'];
         }
 
-        // Step F: Create Sale Order (With updated Partner Shipping ID mapping)
+        // Step F: Create Sale Order (With updated Partner mapping to display the correct name)
         $sale_order_data = array(
-            'partner_id'          => $partner_id,
+            'partner_id'          => $partner_shipping_id, // Forces the SO Customer field to display the friend's name
             'partner_invoice_id'  => $partner_id, // Billing strictly to main contact
             'partner_shipping_id' => $partner_shipping_id, // Maps to either Main Contact or Child Contact
             'warehouse_id'        => $target_warehouse_id,
