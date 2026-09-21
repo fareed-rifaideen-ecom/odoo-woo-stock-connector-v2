@@ -28,7 +28,7 @@ class OWSC_Stock_Sync {
             $domain[] = array( 'id', '=', $target_odoo_product_id );
         }
 
-        // 1. Fetch eligible Odoo products (ADDED: x_studio_force_out_of_stock)
+        // 1. Fetch eligible Odoo products 
         $products = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
             'product.product', 'search_read',
@@ -46,7 +46,7 @@ class OWSC_Stock_Sync {
         $odoo_tmpl_ids    = array();
         $tmpl_to_sku_map  = array();
         $sku_prices       = array(); 
-        $force_oos_map    = array(); // NEW: Store the override flag
+        $force_oos_map    = array();
         
         foreach ( $products as $p ) {
             if ( ! empty( $p['default_code'] ) ) {
@@ -63,7 +63,6 @@ class OWSC_Stock_Sync {
                     $sku_prices[ $sku ] = (float) $p['list_price'];
                 }
 
-                // NEW: Capture the boolean value
                 $force_oos_map[ $sku ] = ! empty( $p['x_studio_force_out_of_stock'] ) ? true : false;
             }
         }
@@ -107,50 +106,36 @@ class OWSC_Stock_Sync {
         }
 
         // 3.5 Subtract UNCONFIRMED Draft/Sent Orders Only
-        $tag_ids = array();
-        $tags = $client->execute_kw( 
-            $config['database'], $uid, $config['api_key'], 
-            'crm.tag', 'search_read', 
-            array( array( array( 'name', '=', 'Online Order' ) ) ), 
-            array( 'fields' => array( 'id' ), 'limit' => 1 ) 
+        // Search exclusively using the new custom Studio field 'x_studio_woo_is_online'
+        $draft_orders = $client->execute_kw(
+            $config['database'], $uid, $config['api_key'],
+            'sale.order', 'search_read',
+            array( array(
+                array( 'state', 'in', array( 'draft', 'sent' ) ),
+                array( 'x_studio_woo_is_online', '=', true )
+            ) ),
+            array( 'fields' => array( 'id' ) )
         );
-        
-        if ( ! is_wp_error( $tags ) && ! empty( $tags ) ) {
-            $tag_ids[] = (int) $tags[0]['id'];
-        }
 
-        if ( ! empty( $tag_ids ) ) {
-            $draft_orders = $client->execute_kw(
+        if ( ! is_wp_error( $draft_orders ) && is_array( $draft_orders ) && ! empty( $draft_orders ) ) {
+            $draft_order_ids = array_column( $draft_orders, 'id' );
+            $draft_lines = $client->execute_kw(
                 $config['database'], $uid, $config['api_key'],
-                'sale.order', 'search_read',
+                'sale.order.line', 'search_read',
                 array( array(
-                    array( 'state', 'in', array( 'draft', 'sent' ) ),
-                    array( 'tag_ids', 'in', $tag_ids ),
-                    array( 'client_order_ref', 'ilike', 'WOO-' ) 
+                    array( 'order_id', 'in', $draft_order_ids ),
+                    array( 'product_id', 'in', $odoo_product_ids ) 
                 ) ),
-                array( 'fields' => array( 'id' ) )
+                array( 'fields' => array( 'product_id', 'product_uom_qty' ) )
             );
 
-            if ( ! is_wp_error( $draft_orders ) && is_array( $draft_orders ) && ! empty( $draft_orders ) ) {
-                $draft_order_ids = array_column( $draft_orders, 'id' );
-                $draft_lines = $client->execute_kw(
-                    $config['database'], $uid, $config['api_key'],
-                    'sale.order.line', 'search_read',
-                    array( array(
-                        array( 'order_id', 'in', $draft_order_ids ),
-                        array( 'product_id', 'in', $odoo_product_ids ) 
-                    ) ),
-                    array( 'fields' => array( 'product_id', 'product_uom_qty' ) )
-                );
-
-                if ( ! is_wp_error( $draft_lines ) && is_array( $draft_lines ) ) {
-                    foreach ( $draft_lines as $line ) {
-                        $pid = $line['product_id'][0] ?? 0;
-                        if ( isset( $product_map[ $pid ] ) ) {
-                            $sku = $product_map[ $pid ];
-                            $draft_qty = (float) ( $line['product_uom_qty'] ?? 0 );
-                            $stock_totals[ $sku ] -= $draft_qty;
-                        }
+            if ( ! is_wp_error( $draft_lines ) && is_array( $draft_lines ) ) {
+                foreach ( $draft_lines as $line ) {
+                    $pid = $line['product_id'][0] ?? 0;
+                    if ( isset( $product_map[ $pid ] ) ) {
+                        $sku = $product_map[ $pid ];
+                        $draft_qty = (float) ( $line['product_uom_qty'] ?? 0 );
+                        $stock_totals[ $sku ] -= $draft_qty;
                     }
                 }
             }
@@ -198,7 +183,6 @@ class OWSC_Stock_Sync {
         $updated_price_count = 0;
 
         foreach ( $stock_totals as $sku => $qty ) {
-            // NEW: Check the override boolean before determining the final quantity
             $is_forced_oos = isset( $force_oos_map[ $sku ] ) ? $force_oos_map[ $sku ] : false;
             $final_qty = $is_forced_oos ? 0 : max( 0, $qty ); 
             
@@ -236,7 +220,6 @@ class OWSC_Stock_Sync {
             }
         }
 
-        // Only update the 'Last Sync' timestamp if this was a full catalog run
         if ( empty( $target_sku ) && empty( $target_odoo_product_id ) ) {
             update_option( 'owsc_last_sync_time', gmdate('Y-m-d H:i:s') );
         }
