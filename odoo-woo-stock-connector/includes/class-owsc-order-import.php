@@ -25,7 +25,7 @@ class OWSC_Order_Import {
         $states_list = WC()->countries->get_states( $country_code );
         $state_name  = isset( $states_list[ $state_code ] ) ? $states_list[ $state_code ] : $state_code;
 
-        // 2. Extract Customer Data
+        // 2. Extract Customer Data (Includes 'note' for Additional Notes)
         $customer_data = array(
             'email'      => $order->get_billing_email(),
             'phone'      => $order->get_billing_phone(),
@@ -37,6 +37,7 @@ class OWSC_Order_Import {
             'country'    => $country_code,
             'state_code' => $state_code,
             'state_name' => $state_name,
+            'note'       => $order->get_customer_note(), // Extracted WooCommerce Customer Note
         );
 
         // 3. Extract Line Items & SKUs
@@ -110,6 +111,7 @@ class OWSC_Order_Import {
         // Step C: Determine Warehouse Routing (Dynamic Priority)
         $shipping_methods = $order->get_shipping_methods();
         $shipping_name    = reset( $shipping_methods ) ? reset( $shipping_methods )->get_name() : 'Delivery Around UAE';
+        $payment_title    = $order->get_payment_method_title() ?: 'Unknown Payment';
 
         $priority_string = $config['priority_uae'] ?: 'WH,MC,JM';
         if ( stripos( $shipping_name, 'Jumeirah' ) !== false ) {
@@ -246,12 +248,7 @@ class OWSC_Order_Import {
             );
         }
 
-        $payment_title = $order->get_payment_method_title() ?: 'Unknown Payment';
-        $order_lines[] = array( 0, 0, array(
-            'display_type' => 'line_note',
-            'name'         => sprintf( "Delivery Method: %s\nPayment Method: %s", $shipping_name, $payment_title )
-        ) );
-
+        // Add Dynamic Delivery Charges 
         $shipping_total = (float) $order->get_shipping_total();
         if ( $shipping_total > 0 ) {
             $delivery_sku = '';
@@ -286,17 +283,7 @@ class OWSC_Order_Import {
             }
         }
 
-        $sale_tag_ids = array();
-        $sale_tags = $client->execute_kw( 
-            $config['database'], $uid, $config['api_key'], 
-            'crm.tag', 'search_read', 
-            array( array( array( 'name', '=', 'Online Order' ) ) ), 
-            array( 'fields' => array( 'id' ), 'limit' => 1 ) 
-        );
-        if ( ! is_wp_error( $sale_tags ) && ! empty( $sale_tags ) ) {
-            $sale_tag_ids[] = (int) $sale_tags[0]['id'];
-        }
-
+        // Step E: Get the Sales Team
         $team_id = null;
         $sales_teams = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
@@ -308,19 +295,36 @@ class OWSC_Order_Import {
             $team_id = (int) $sales_teams[0]['id'];
         }
 
-        // Step F: Create Sale Order (With updated Partner mapping to display the correct name)
+        // Format a clean address string
+        $full_address = trim( sprintf( '%s %s, %s, %s, %s', 
+            $customer_data['street'], 
+            $customer_data['street2'], 
+            $customer_data['city'], 
+            $customer_data['state_name'], 
+            $customer_data['country'] 
+        ) );
+        $full_address = preg_replace( '/\s+,/', ',', $full_address ); 
+
+        // Step F: Create Sale Order (With custom Studio fields mapped & cast to string to prevent null errors)
         $sale_order_data = array(
-            'partner_id'          => $partner_shipping_id, // Forces the SO Customer field to display the friend's name
-            'partner_invoice_id'  => $partner_id, // Billing strictly to main contact
-            'partner_shipping_id' => $partner_shipping_id, // Maps to either Main Contact or Child Contact
+            'partner_id'          => $partner_shipping_id,
+            'partner_invoice_id'  => $partner_id,
+            'partner_shipping_id' => $partner_shipping_id,
             'warehouse_id'        => $target_warehouse_id,
-            'client_order_ref'    => 'WOO-' . $order->get_id(),
             'order_line'          => $order_lines,
+            
+            // Cast to string to prevent silent null rejections from Odoo
+            'x_studio_woo_customer_name'    => (string) $customer_data['name'],
+            'x_studio_woo_email'            => (string) $customer_data['email'],
+            'x_studio_woo_phone'            => (string) $customer_data['phone'],
+            'x_studio_woo_address'          => (string) $full_address,
+            'x_studio_woo_additional_notes' => (string) $customer_data['note'],
+            'x_studio_woo_delivery_method'  => (string) $shipping_name,
+            'x_studio_woo_payment_method'   => (string) $payment_title,
+            'x_studio_woo_order_id'         => (string) ('WOO-' . $order->get_id()),
+            'x_studio_woo_is_online'        => true,
         );
 
-        if ( ! empty( $sale_tag_ids ) ) {
-            $sale_order_data['tag_ids'] = array( array( 6, 0, $sale_tag_ids ) );
-        }
         if ( $team_id ) {
             $sale_order_data['team_id'] = $team_id;
         }
@@ -331,10 +335,24 @@ class OWSC_Order_Import {
             array( $sale_order_data ) 
         );
 
-        if ( is_wp_error( $sale_order_id ) || ! is_int( $sale_order_id ) ) {
-            $order->add_order_note( 'Odoo Connector Exception: Failed to create Sale Order in Odoo.' );
+        // ==========================================
+        // ENHANCED DEBUG CATCHER: Intercepts raw Odoo API faults
+        // ==========================================
+        if ( is_wp_error( $sale_order_id ) ) {
+            $order->add_order_note( 'Odoo API Error: ' . $sale_order_id->get_error_message() );
+            return;
+        } elseif ( is_array( $sale_order_id ) && isset( $sale_order_id['faultString'] ) ) {
+            // Odoo returns exact field mismatches inside faultString
+            $order->add_order_note( 'Odoo XML-RPC Fault: ' . $sale_order_id['faultString'] );
+            return;
+        } elseif ( is_array( $sale_order_id ) && isset( $sale_order_id['faultCode'] ) ) {
+            $order->add_order_note( 'Odoo XML-RPC Fault Code: ' . $sale_order_id['faultCode'] );
+            return;
+        } elseif ( ! is_int( $sale_order_id ) || $sale_order_id <= 0 ) {
+            $order->add_order_note( 'Odoo API Error: Unexpected response payload. Raw output: ' . print_r( $sale_order_id, true ) );
             return;
         }
+        // ==========================================
 
         if ( $is_auto_confirm_enabled && $can_auto_confirm ) {
             $client->execute_kw( 
@@ -359,7 +377,6 @@ class OWSC_Order_Import {
     private function resolve_customer( $client, $config, $uid, $customer_data ): array {
         $partner_id = 0;
 
-        // 1. Search existing contact by Email
         if ( ! empty( $customer_data['email'] ) ) {
             $partners = $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
@@ -372,7 +389,6 @@ class OWSC_Order_Import {
             }
         }
 
-        // 2. Search existing contact by Phone if Email failed
         if ( ! $partner_id && ! empty( $customer_data['phone'] ) ) {
             $partners = $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
@@ -385,7 +401,6 @@ class OWSC_Order_Import {
             }
         }
 
-        // 3. Resolve Geographical Dependencies (Country & State)
         $country_id = null;
         if ( ! empty( $customer_data['country'] ) ) {
             $countries = $client->execute_kw(
@@ -417,7 +432,6 @@ class OWSC_Order_Import {
             }
         }
 
-        // Pre-build the generic address array for use in child or main contact creation
         $address_payload = array(
             'name'    => $customer_data['name'] ?: 'WooCommerce Guest',
             'street'  => $customer_data['street'],
@@ -435,16 +449,12 @@ class OWSC_Order_Import {
             $address_payload['state_id'] = $state_id; 
         }
 
-        // 4. Handle Matching Logic (Strict Reuse vs Child Generation)
         if ( $partner_id > 0 ) {
             $sync_mode = $config['customer_sync_mode'] ?? 'strict_reuse';
 
             if ( $sync_mode === 'strict_reuse' ) {
-                // OPTION 2: Stop processing and return the existing contact unconditionally.
                 return array( 'partner_id' => $partner_id, 'partner_shipping_id' => $partner_id );
-            
             } else {
-                // OPTION 1: Compare addresses. Create a child contact if the details differ.
                 $main_contact = $client->execute_kw(
                     $config['database'], $uid, $config['api_key'],
                     'res.partner', 'read',
@@ -465,7 +475,6 @@ class OWSC_Order_Import {
                     return array( 'partner_id' => $partner_id, 'partner_shipping_id' => $partner_id );
                 }
 
-                // Look for an existing child delivery contact under this parent matching this exact friend's details
                 $child_contacts = $client->execute_kw(
                     $config['database'], $uid, $config['api_key'],
                     'res.partner', 'search_read',
@@ -482,7 +491,6 @@ class OWSC_Order_Import {
                     return array( 'partner_id' => $partner_id, 'partner_shipping_id' => (int) $child_contacts[0]['id'] );
                 }
 
-                // Create a completely new child contact 
                 $child_payload = $address_payload;
                 $child_payload['parent_id'] = $partner_id;
                 $child_payload['type']      = 'delivery';
@@ -497,12 +505,10 @@ class OWSC_Order_Import {
                     return array( 'partner_id' => $partner_id, 'partner_shipping_id' => $new_child_id );
                 }
 
-                // Failsafe fallback to main parent if child creation fails
                 return array( 'partner_id' => $partner_id, 'partner_shipping_id' => $partner_id );
             }
             
         } else {
-            // No Match: Create a completely new primary customer in Odoo
             $address_payload['email'] = $customer_data['email'];
 
             $tags = $client->execute_kw( 
