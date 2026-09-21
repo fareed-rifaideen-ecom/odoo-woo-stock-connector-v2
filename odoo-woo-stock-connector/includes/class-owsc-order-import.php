@@ -283,7 +283,7 @@ class OWSC_Order_Import {
             }
         }
 
-        // Step E: Get the Sales Team (Tags logic removed to keep native CRM clean)
+        // Step E: Get the Sales Team
         $team_id = null;
         $sales_teams = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
@@ -295,7 +295,7 @@ class OWSC_Order_Import {
             $team_id = (int) $sales_teams[0]['id'];
         }
 
-        // Format a clean address string for the text field
+        // Format a clean address string
         $full_address = trim( sprintf( '%s %s, %s, %s, %s', 
             $customer_data['street'], 
             $customer_data['street2'], 
@@ -303,24 +303,24 @@ class OWSC_Order_Import {
             $customer_data['state_name'], 
             $customer_data['country'] 
         ) );
-        $full_address = preg_replace( '/\s+,/', ',', $full_address ); // Clean trailing commas
+        $full_address = preg_replace( '/\s+,/', ',', $full_address ); 
 
-        // Step F: Create Sale Order (With custom Studio fields mapped)
+        // Step F: Create Sale Order (With custom Studio fields mapped & cast to string to prevent null errors)
         $sale_order_data = array(
-            'partner_id'          => $partner_shipping_id, // Forces the SO Customer field to display the friend's name
-            'partner_invoice_id'  => $partner_id, // Billing strictly to main contact
-            'partner_shipping_id' => $partner_shipping_id, // Maps to either Main Contact or Child Contact
+            'partner_id'          => $partner_shipping_id,
+            'partner_invoice_id'  => $partner_id,
+            'partner_shipping_id' => $partner_shipping_id,
             'warehouse_id'        => $target_warehouse_id,
             'order_line'          => $order_lines,
             
-            // New WooCommerce Custom Fields mapped precisely to Odoo Studio names
-            'x_studio_woo_customer_name'    => $customer_data['name'],
-            'x_studio_woo_email'            => $customer_data['email'],
-            'x_studio_woo_phone'            => $customer_data['phone'],
-            'x_studio_woo_address'          => $full_address,
-            'x_studio_woo_additional_notes' => $customer_data['note'],
-            'x_studio_woo_delivery_method'  => $shipping_name,
-            'x_studio_woo_payment_method'   => $payment_title,
+            // Cast to string to prevent silent null rejections from Odoo
+            'x_studio_woo_customer_name'    => (string) $customer_data['name'],
+            'x_studio_woo_email'            => (string) $customer_data['email'],
+            'x_studio_woo_phone'            => (string) $customer_data['phone'],
+            'x_studio_woo_address'          => (string) $full_address,
+            'x_studio_woo_additional_notes' => (string) $customer_data['note'],
+            'x_studio_woo_delivery_method'  => (string) $shipping_name,
+            'x_studio_woo_payment_method'   => (string) $payment_title,
             'x_studio_woo_order_id'         => 'WOO-' . $order->get_id(),
             'x_studio_woo_is_online'        => true,
         );
@@ -335,10 +335,20 @@ class OWSC_Order_Import {
             array( $sale_order_data ) 
         );
 
-        if ( is_wp_error( $sale_order_id ) || ! is_int( $sale_order_id ) ) {
-            $order->add_order_note( 'Odoo Connector Exception: Failed to create Sale Order in Odoo.' );
+        // ==========================================
+        // CRITICAL DEBUGGING: Catch Odoo API Faults
+        // ==========================================
+        if ( is_wp_error( $sale_order_id ) ) {
+            $order->add_order_note( 'Odoo API Error: ' . $sale_order_id->get_error_message() );
+            return;
+        } elseif ( is_array( $sale_order_id ) && isset( $sale_order_id['faultString'] ) ) {
+            $order->add_order_note( 'Odoo API Error: ' . $sale_order_id['faultString'] );
+            return;
+        } elseif ( ! is_int( $sale_order_id ) || $sale_order_id <= 0 ) {
+            $order->add_order_note( 'Odoo API Error: Unexpected response. ' . print_r( $sale_order_id, true ) );
             return;
         }
+        // ==========================================
 
         if ( $is_auto_confirm_enabled && $can_auto_confirm ) {
             $client->execute_kw( 
