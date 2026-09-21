@@ -25,7 +25,7 @@ class OWSC_Order_Import {
         $states_list = WC()->countries->get_states( $country_code );
         $state_name  = isset( $states_list[ $state_code ] ) ? $states_list[ $state_code ] : $state_code;
 
-        // 2. Extract Customer Data (Now includes 'note' for Additional Notes)
+        // 2. Extract Customer Data (Includes 'note' for Additional Notes)
         $customer_data = array(
             'email'      => $order->get_billing_email(),
             'phone'      => $order->get_billing_phone(),
@@ -283,7 +283,7 @@ class OWSC_Order_Import {
             }
         }
 
-        // Step E: Get the Sales Team (Removed CRM Tags search here)
+        // Step E: Get the Sales Team (Removed legacy CRM tag logic)
         $team_id = null;
         $sales_teams = $client->execute_kw(
             $config['database'], $uid, $config['api_key'],
@@ -307,9 +307,9 @@ class OWSC_Order_Import {
 
         // Step F: Create Sale Order (Mapped to Studio fields, cast to string)
         $sale_order_data = array(
-            'partner_id'          => $partner_shipping_id, // Forces SO Customer field to display friend's name if applicable
+            'partner_id'          => $partner_shipping_id, // Displays specific recipient name
             'partner_invoice_id'  => $partner_id, // Billing strictly to main contact
-            'partner_shipping_id' => $partner_shipping_id, // Maps to either Main Contact or Child Contact
+            'partner_shipping_id' => $partner_shipping_id, // Physical delivery mapping
             'warehouse_id'        => $target_warehouse_id,
             'order_line'          => $order_lines,
             
@@ -322,7 +322,7 @@ class OWSC_Order_Import {
             'x_studio_woo_delivery_method'  => (string) $shipping_name,
             'x_studio_woo_payment_method'   => (string) $payment_title,
             'x_studio_woo_order_id'         => (string) ('WOO-' . $order->get_id()),
-            'x_studio_woo_is_online'        => true,
+            'x_studio_woo_is_online'        => true, // Boolean flag for inventory filters
         );
 
         if ( $team_id ) {
@@ -376,7 +376,6 @@ class OWSC_Order_Import {
     private function resolve_customer( $client, $config, $uid, $customer_data ): array {
         $partner_id = 0;
 
-        // 1. Search existing contact by Email
         if ( ! empty( $customer_data['email'] ) ) {
             $partners = $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
@@ -389,7 +388,6 @@ class OWSC_Order_Import {
             }
         }
 
-        // 2. Search existing contact by Phone if Email failed
         if ( ! $partner_id && ! empty( $customer_data['phone'] ) ) {
             $partners = $client->execute_kw( 
                 $config['database'], $uid, $config['api_key'], 
@@ -402,7 +400,6 @@ class OWSC_Order_Import {
             }
         }
 
-        // 3. Resolve Geographical Dependencies (Country & State)
         $country_id = null;
         if ( ! empty( $customer_data['country'] ) ) {
             $countries = $client->execute_kw(
@@ -451,7 +448,6 @@ class OWSC_Order_Import {
             $address_payload['state_id'] = $state_id; 
         }
 
-        // 4. Handle Matching Logic (Strict Reuse vs Child Generation)
         if ( $partner_id > 0 ) {
             $sync_mode = $config['customer_sync_mode'] ?? 'strict_reuse';
 
