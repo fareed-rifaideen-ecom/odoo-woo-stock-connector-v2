@@ -25,18 +25,23 @@ class OWSC_Order_Import {
         $states_list = WC()->countries->get_states( $country_code );
         $state_name  = isset( $states_list[ $state_code ] ) ? $states_list[ $state_code ] : $state_code;
 
+        $countries_list = WC()->countries->get_countries();
+        $country_name   = isset( $countries_list[ $country_code ] ) ? $countries_list[ $country_code ] : $country_code;
+
         // 2. Extract Customer Data
         $customer_data = array(
-            'email'      => $order->get_billing_email(),
-            'phone'      => $order->get_billing_phone(),
-            'name'       => trim( $order->get_shipping_first_name() . ' ' . $order->get_shipping_last_name() ) ?: trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
-            'street'     => $order->get_shipping_address_1() ?: $order->get_billing_address_1(),
-            'street2'    => $order->get_shipping_address_2() ?: $order->get_billing_address_2(),
-            'city'       => $order->get_shipping_city() ?: $order->get_billing_city(),
-            'zip'        => $order->get_shipping_postcode() ?: $order->get_billing_postcode(),
-            'country'    => $country_code,
-            'state_code' => $state_code,
-            'state_name' => $state_name,
+            'email'         => $order->get_billing_email(),
+            'phone'         => $order->get_billing_phone(),
+            'name'          => trim( $order->get_shipping_first_name() . ' ' . $order->get_shipping_last_name() ) ?: trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
+            'street'        => $order->get_shipping_address_1() ?: $order->get_billing_address_1(),
+            'street2'       => $order->get_shipping_address_2() ?: $order->get_billing_address_2(),
+            'city'          => $order->get_shipping_city() ?: $order->get_billing_city(),
+            'zip'           => $order->get_shipping_postcode() ?: $order->get_billing_postcode(),
+            'country'       => $country_code,
+            'country_name'  => $country_name,
+            'state_code'    => $state_code,
+            'state_name'    => $state_name,
+            'customer_note' => $order->get_customer_note(),
         );
 
         // 3. Extract Line Items & SKUs
@@ -293,13 +298,23 @@ class OWSC_Order_Import {
         }
 
         // Format address block specifically for the multiline text field
-        $address_parts = array_filter( array(
-            $customer_data['street'],
-            $customer_data['street2'],
-            $customer_data['city'] . ( $customer_data['state_name'] ? ', ' . $customer_data['state_name'] : '' ) . ' ' . $customer_data['zip'],
-            $customer_data['country']
-        ) );
-        $woo_address_formatted = implode( "\n", $address_parts );
+        $address_lines = array();
+        if ( ! empty( $customer_data['street'] ) ) {
+            $address_lines[] = 'Street Address: ' . $customer_data['street'];
+        }
+        if ( ! empty( $customer_data['street2'] ) ) {
+            $address_lines[] = 'Street 2: ' . $customer_data['street2'];
+        }
+        if ( ! empty( $customer_data['city'] ) ) {
+            $address_lines[] = 'Town / City: ' . $customer_data['city'];
+        }
+        if ( ! empty( $customer_data['state_name'] ) ) {
+            $address_lines[] = 'Emirate: ' . $customer_data['state_name'];
+        }
+        if ( ! empty( $customer_data['country_name'] ) ) {
+            $address_lines[] = 'Country / Region: ' . $customer_data['country_name'];
+        }
+        $woo_address_formatted = implode( "\n", $address_lines );
 
         // Step F: Create Sale Order (With custom WooCommerce Info fields mapping)
         $sale_order_data = array(
@@ -313,6 +328,7 @@ class OWSC_Order_Import {
             'x_studio_woo_email'           => $customer_data['email'],
             'x_studio_woo_phone'           => $customer_data['phone'],
             'x_studio_woo_address'         => $woo_address_formatted,
+            'x_studio_woo_order_notes'     => $customer_data['customer_note'],
             'x_studio_woo_delivery_method' => $shipping_name,
             'x_studio_woo_payment_method'  => $payment_title,
             'x_studio_woo_order_id'        => 'WOO-' . $order->get_id(),
